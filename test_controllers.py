@@ -43,15 +43,22 @@ FALLBACK_CONTROLLER_IPS = [
 ]
 
 # CiA 402 object dictionary entries to read for a quick health check.
-# (index, subindex, human-readable name)
+# (index, subindex, human-readable name, bit width, signed?)
 READ_OBJECTS = [
-    (0x6041, 0x00, "Statusword"),
-    (0x6061, 0x00, "Mode of operation (display)"),
-    (0x6064, 0x00, "Position actual value"),
-    (0x606C, 0x00, "Velocity actual value"),
-    (0x6077, 0x00, "Torque actual value"),
-    (0x1003, 0x00, "Error count"),
+    (0x6041, 0x00, "Statusword", 16, False),
+    (0x6061, 0x00, "Mode of operation (display)", 8, True),
+    (0x6064, 0x00, "Position actual value", 32, True),
+    (0x606C, 0x00, "Velocity actual value", 32, True),
+    (0x6077, 0x00, "Torque actual value", 16, True),
+    (0x1003, 0x00, "Error count", 8, False),
 ]
+
+
+def to_signed(value, bits):
+    """Reinterpret an unsigned register value as a signed integer of the given width."""
+    if value >= (1 << (bits - 1)):
+        value -= (1 << bits)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -121,28 +128,29 @@ def read_and_print_device_data(accessor, device_handle, description):
     # --- Static device info (via dedicated accessor calls) ---
     name = accessor.getDeviceName(device_handle)
     if not name.hasError():
-        print(f"    Name              : {name.getResult()}")
+        print(f"    {'Name':<28}: {name.getResult()}")
 
     product = accessor.getDeviceProductCode(device_handle)
     if not product.hasError():
-        print(f"    Product code      : {product.getResult()}")
+        print(f"    {'Product code':<28}: {product.getResult()}")
 
     serial = accessor.getDeviceSerialNumber(device_handle)
     if not serial.hasError():
-        print(f"    Serial number     : {serial.getResult()}")
+        print(f"    {'Serial number':<28}: {serial.getResult()}")
 
     state = accessor.getConnectionState(device_handle)
     if not state.hasError():
-        print(f"    Connection state  : {CONNECTION_STATES.get(state.getResult(), 'unknown')}")
+        print(f"    {'Connection state':<28}: {CONNECTION_STATES.get(state.getResult(), 'unknown')}")
 
     # --- Live object dictionary values ---
-    for index, subindex, label in READ_OBJECTS:
+    for index, subindex, label, bits, signed in READ_OBJECTS:
         result = accessor.readNumber(device_handle, Nanolib.OdIndex(index, subindex))
         if result.hasError():
-            print(f"    {label:<18}: <read error: {result.getError()}>")
+            print(f"    {label:<28}: <read error: {result.getError()}>")
         else:
-            value = result.getResult()
-            print(f"    {label:<18}: {value} (0x{value & 0xFFFFFFFF:X})")
+            raw = result.getResult() & ((1 << bits) - 1)
+            value = to_signed(raw, bits) if signed else raw
+            print(f"    {label:<28}: {value} (0x{raw:0{bits // 4}X})")
 
 
 def test_bus(accessor, bus_id, scan_callback):
