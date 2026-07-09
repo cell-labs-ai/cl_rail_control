@@ -44,4 +44,16 @@ When finished, deactivate the virtual environment:
 deactivate
 ```
 
+### Testing the Controllers
+
+`test_controllers.py` is a simple connectivity test. It opens the Modbus TCP (WiFi) bus, discovers the motor controllers, connects to each, reads and prints some data (device info, statusword, position, velocity, torque, error count), then disconnects.
+
+With the virtual environment activated, run it from the repo root:
+
+```bash
+python test_controllers.py
+```
+
+No IP configuration is needed — the controllers are discovered automatically on the wireless interface. (If auto-discovery fails, the script falls back to the fixed IPs defined near the top of the file.)
+
 
