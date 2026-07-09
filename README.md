@@ -17,6 +17,8 @@
 
 ### Running Examples
 
+> ⚠️ **IMPORTANT DISCLAIMER**: Before running any examples, ensure that **no other tools or applications** are connected to the motor controllers. Running examples while other tools are accessing the controllers can cause unexpected behavior or conflicts.
+
 After installation, you can run the example scripts. First, activate the virtual environment:
 
 ```bash
