@@ -6,7 +6,7 @@
 
 1. Run the install script to set up the environment and install dependencies:
    ```bash
-   ./install.sh
+   bash install.sh
    ```
    
    This script will:
