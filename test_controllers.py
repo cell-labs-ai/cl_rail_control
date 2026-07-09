@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
 """
-Simple connectivity test for the two Nanotec motor controllers over Modbus TCP (WiFi).
+Simple connectivity test for the Nanotec motor controllers over Modbus TCP (WiFi).
 
 What it does:
-  1. Opens a Modbus TCP bus for each configured controller IP.
-  2. Scans / discovers the device(s) on that bus.
+  1. Lists the available bus hardware and picks the Modbus TCP bus(es).
+  2. Opens each bus and scans it to DISCOVER the controllers (no IPs needed).
   3. Connects to each discovered device.
   4. Reads and prints some basic info + live data for testing.
   5. Disconnects and closes the bus cleanly.
 
 Notes:
   - The bundled nanolib package is built for aarch64 (arm64), so this must run on
-    the target device (e.g. the arm64 SBC on the rail), not on an x86_64 PC.
+    the target device (e.g. the Raspberry Pi on the rail), not on an x86_64 PC.
   - Run inside the project virtualenv:
         source .venv/bin/activate
         python test_controllers.py
   - IMPORTANT: make sure no other tool/app is talking to the controllers while this runs.
 
-Edit CONTROLLER_IPS below to match your two controllers.
+If auto-discovery finds no Modbus TCP bus, the script falls back to the fixed
+IP addresses in FALLBACK_CONTROLLER_IPS below.
 """
 
+import os
 import sys
 
 # The nanolib package lives under nanolib_python_linux; make it importable
 # regardless of the current working directory.
-import os
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "nanolib_python_linux"))
 
@@ -35,11 +36,10 @@ from nanotec_nanolib import Nanolib
 # Configuration
 # ---------------------------------------------------------------------------
 
-# IP addresses of the two motor controllers on the WiFi network.
-# Adjust to match your setup.
-CONTROLLER_IPS = [
-    "192.168.0.2",
-    "192.168.0.3",
+# Only used if auto-discovery finds no Modbus TCP bus hardware.
+FALLBACK_CONTROLLER_IPS = [
+    "192.168.0.164",
+    "192.168.0.168",
 ]
 
 # CiA 402 object dictionary entries to read for a quick health check.
@@ -63,11 +63,11 @@ class ScanBusCallback(Nanolib.NlcScanBusCallback):
 
     def callback(self, info, devices_found, data):
         if info == Nanolib.BusScanInfo_Start:
-            print("    scan started ", end="", flush=True)
+            print("    scanning ", end="", flush=True)
         elif info == Nanolib.BusScanInfo_Progress:
             print(".", end="", flush=True)
         elif info == Nanolib.BusScanInfo_Finished:
-            print(" finished")
+            print(" done")
         return Nanolib.ResultVoid()
 
 
@@ -78,14 +78,40 @@ CONNECTION_STATES = {
 }
 
 
+def bus_options_for(bus_id):
+    """Return the BusHardwareOptions needed to open the given bus hardware."""
+    # Modbus TCP needs no extra options; return an empty option set.
+    return Nanolib.BusHardwareOptions()
+
+
 def make_modbus_tcp_bus_id(ip_address):
-    """Build a Modbus TCP bus hardware id for a controller at the given IP."""
+    """Build a Modbus TCP bus hardware id for a controller at the given IP (fallback path)."""
     return Nanolib.BusHardwareId(
-        Nanolib.BUS_HARDWARE_ID_NETWORK,             # bus hardware
+        Nanolib.BUS_HARDWARE_ID_NETWORK,              # bus hardware
         Nanolib.BUS_HARDWARE_ID_PROTOCOL_MODBUS_TCP,  # protocol
         ip_address,                                   # hardware specifier (the IP)
         f"Modbus TCP {ip_address}",                   # friendly name
     )
+
+
+def discover_modbus_tcp_buses(accessor):
+    """List available bus hardware and return the Modbus TCP entries."""
+    result = accessor.listAvailableBusHardware()
+    if result.hasError():
+        print(f"ERROR listing bus hardware: {result.getError()}")
+        return []
+
+    all_buses = result.getResult()
+    print(f"Available bus hardware ({len(all_buses)}):")
+    tcp_buses = []
+    for bus_id in all_buses:
+        protocol = bus_id.getProtocol()
+        print(f"  - {bus_id.getName()} "
+              f"[protocol: {protocol}, specifier: {bus_id.getHardwareSpecifier()}]")
+        if protocol == Nanolib.BUS_HARDWARE_ID_PROTOCOL_MODBUS_TCP:
+            tcp_buses.append(bus_id)
+
+    return tcp_buses
 
 
 def read_and_print_device_data(accessor, device_handle, description):
@@ -119,15 +145,13 @@ def read_and_print_device_data(accessor, device_handle, description):
             print(f"    {label:<18}: {value} (0x{value & 0xFFFFFFFF:X})")
 
 
-def test_controller(accessor, ip_address, scan_callback):
-    """Open the bus for one controller IP, discover, connect, read, and clean up."""
-    print(f"\n=== Controller @ {ip_address} ===")
-
-    bus_id = make_modbus_tcp_bus_id(ip_address)
-    bus_options = Nanolib.BusHardwareOptions()  # Modbus TCP needs no extra options
+def test_bus(accessor, bus_id, scan_callback):
+    """Open one bus, discover, connect, read from every device, and clean up."""
+    print(f"\n=== Bus: {bus_id.getName()} "
+          f"(specifier: {bus_id.getHardwareSpecifier()}) ===")
 
     print("  Opening bus ...")
-    open_result = accessor.openBusHardwareWithProtocol(bus_id, bus_options)
+    open_result = accessor.openBusHardwareWithProtocol(bus_id, bus_options_for(bus_id))
     if open_result.hasError():
         print(f"  ERROR opening bus: {open_result.getError()}")
         return
@@ -148,7 +172,8 @@ def test_controller(accessor, ip_address, scan_callback):
         print(f"  Found {len(device_ids)} device(s).")
 
         for device_id in device_ids:
-            description = device_id.getDescription() or f"id {device_id.getDeviceId()}"
+            description = (device_id.getDescription()
+                           or f"id {device_id.getDeviceId()}")
 
             add_result = accessor.addDevice(device_id)
             if add_result.hasError():
@@ -187,14 +212,27 @@ def main():
 
     scan_callback = ScanBusCallback()
 
-    print("Nanotec Modbus TCP controller test")
-    print(f"Controllers to test: {', '.join(CONTROLLER_IPS)}")
+    print("Nanotec Modbus TCP controller test\n")
 
-    for ip in CONTROLLER_IPS:
-        try:
-            test_controller(accessor, ip, scan_callback)
-        except Exception as exc:  # keep going for the other controller
-            print(f"  UNEXPECTED ERROR for {ip}: {exc}")
+    # Preferred path: discover the Modbus TCP bus hardware and scan it, so the
+    # controllers are found without knowing their IP addresses in advance.
+    tcp_buses = discover_modbus_tcp_buses(accessor)
+
+    if tcp_buses:
+        for bus_id in tcp_buses:
+            try:
+                test_bus(accessor, bus_id, scan_callback)
+            except Exception as exc:
+                print(f"  UNEXPECTED ERROR: {exc}")
+    else:
+        # Fallback: no Modbus TCP bus auto-detected, use fixed IPs instead.
+        print("\nNo Modbus TCP bus auto-detected. "
+              f"Falling back to fixed IPs: {', '.join(FALLBACK_CONTROLLER_IPS)}")
+        for ip in FALLBACK_CONTROLLER_IPS:
+            try:
+                test_bus(accessor, make_modbus_tcp_bus_id(ip), scan_callback)
+            except Exception as exc:
+                print(f"  UNEXPECTED ERROR for {ip}: {exc}")
 
     print("\nDone.")
     return 0
