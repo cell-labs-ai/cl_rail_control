@@ -16,6 +16,9 @@ source .venv/bin/activate
 # install nanolib
 pip install nanolib_python_linux/nanotec_nanolib_linux_arm64-1.4.0-py3-none-linux_aarch64.whl
 
+# deactivate the virtual environment
+deactivate
+
 # print success message
 echo "Installation complete. To activate the virtual environment, run 'source .venv/bin/activate'."
 
