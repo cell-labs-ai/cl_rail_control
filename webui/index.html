@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rail Control</title>
   <link rel="stylesheet" href="/style.css">
+  <script>
+    document.documentElement.setAttribute("data-theme", localStorage.getItem("theme") || "dark");
+  </script>
 </head>
 <body>
   <header class="topbar">
@@ -12,6 +15,9 @@
     <div class="conn">
       <span id="mode-badge" class="badge">…</span>
       <span id="link-badge" class="badge">connecting…</span>
+      <button class="btn-round" id="theme-toggle" title="Toggle light/dark theme">
+        <span id="theme-icon">☀️</span><span id="theme-label">Light</span>
+      </button>
     </div>
   </header>
 

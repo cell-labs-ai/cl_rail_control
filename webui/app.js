@@ -20,6 +20,28 @@ const panelsEl = document.getElementById("panels");
 const linkBadge = document.getElementById("link-badge");
 const modeBadge = document.getElementById("mode-badge");
 
+// --- theme toggle ----------------------------------------------------------
+
+function getTheme() {
+  return localStorage.getItem("theme") || "dark";
+}
+
+function updateThemeToggle(theme) {
+  document.getElementById("theme-icon").textContent = theme === "dark" ? "☀️" : "🌙";
+  document.getElementById("theme-label").textContent = theme === "dark" ? "Light" : "Dark";
+}
+
+function setTheme(theme) {
+  localStorage.setItem("theme", theme);
+  document.documentElement.setAttribute("data-theme", theme);
+  updateThemeToggle(theme);
+}
+
+document.getElementById("theme-toggle").addEventListener("click", () => {
+  setTheme(getTheme() === "dark" ? "light" : "dark");
+});
+updateThemeToggle(getTheme());
+
 const panels = {};   // name -> { root, inputs: {key: el}, readoutCells: {key: td}, flags, errLine }
 let config = null;
 
