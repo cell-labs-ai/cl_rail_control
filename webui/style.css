@@ -167,6 +167,7 @@ main {
 .flag.on-conn { color: var(--status-ready); border-color: var(--status-ready); }
 .flag.on-drive { color: var(--status-info); border-color: var(--status-info); }
 .flag.on-pid { color: var(--status-warn); border-color: var(--status-warn); }
+.flag.on-limit { color: var(--status-error); border-color: var(--status-error); background: color-mix(in srgb, var(--status-error) 15%, transparent); }
 
 .panel-body { padding: 1.25rem; display: flex; flex-direction: column; gap: 1.25rem; }
 
@@ -206,6 +207,7 @@ main {
 .jog.btn-neg { background: var(--tech-orange); }
 .jog.btn-pos { background: var(--status-ready); }
 .jog:active { filter: brightness(1.1); transform: scale(0.97); }
+.jog:disabled { background: var(--status-off); cursor: not-allowed; box-shadow: none; }
 .estop { flex: 0 0 90px; background: var(--status-error); letter-spacing: 1px; }
 .hint { margin: 0.5rem 0 0; font-size: 0.75rem; color: var(--text-muted); }
 

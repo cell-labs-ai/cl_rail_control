@@ -176,8 +176,10 @@ function buildPanel(ctrl) {
 
   // Jog buttons (hold-to-jog).
   const labels = JOG_LABELS[ctrl.role] || JOG_LABELS.cart;
+  const jogButtons = {};
   root.querySelectorAll(".jog").forEach((btn) => {
     const dir = btn.dataset.dir;
+    jogButtons[dir] = btn;
     btn.textContent = labels[dir] || (dir === "1" ? "+" : "-");
     const start = (e) => { e.preventDefault(); post(name, "jog", { direction: Number(dir) }); };
     const stop = (e) => { e.preventDefault(); post(name, "jog_stop", {}); };
@@ -215,10 +217,13 @@ function buildPanel(ctrl) {
     inputs,
     valEls,
     readoutCells,
+    jogButtons,
     flags: {
       conn: root.querySelector(".flag-conn"),
       drive: root.querySelector(".flag-drive"),
       pid: root.querySelector(".flag-pid"),
+      negLimit: root.querySelector(".flag-neg-limit"),
+      posLimit: root.querySelector(".flag-pos-limit"),
     },
     pidToggle,
     errLine: root.querySelector(".err-line"),
@@ -283,8 +288,20 @@ function updatePanel(name, data) {
   p.pidToggle.textContent = data.pid_running ? "Stop PID" : "Start PID";
   p.pidToggle.classList.toggle("running", data.pid_running);
 
-  // Readout.
+  // End stops (60FDh bit 0 = negative limit switch, bit 1 = positive limit
+  // switch). Null (not yet read / unavailable) reads as clear, not triggered.
   const state = data.state || {};
+  p.flags.negLimit.textContent = state.neg_limit ? "NEG ENDSTOP" : "neg endstop";
+  p.flags.negLimit.classList.toggle("on-limit", !!state.neg_limit);
+  p.flags.posLimit.textContent = state.pos_limit ? "POS ENDSTOP" : "pos endstop";
+  p.flags.posLimit.classList.toggle("on-limit", !!state.pos_limit);
+
+  // Block jogging further into a triggered end stop; the opposite
+  // direction stays enabled so the cart can be driven back off it.
+  if (p.jogButtons["1"]) p.jogButtons["1"].disabled = !!state.pos_limit;
+  if (p.jogButtons["-1"]) p.jogButtons["-1"].disabled = !!state.neg_limit;
+
+  // Readout.
   for (const [key, { cell, fmt }] of Object.entries(p.readoutCells)) {
     cell.textContent = fmtReadout(fmt, state[key]);
   }

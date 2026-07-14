@@ -58,6 +58,13 @@ OD_NANOJ_CONTROL = Nanolib.OdIndex(0x2300, 0x00)
 OD_MODE_OF_OPERATION = Nanolib.OdIndex(0x6060, 0x00)
 OD_TARGET_VELOCITY = Nanolib.OdIndex(0x60FF, 0x00)
 
+# Digital Inputs (60FDh): bit 0 = negative limit switch (NLS), bit 1 =
+# positive limit switch (PLS) -- see C5-E manual, chapter 10 "60FDh Digital
+# Inputs" and chapter 7.1.2 "Digital inputs".
+OD_DIGITAL_INPUTS = Nanolib.OdIndex(0x60FD, 0x00)
+DIGITAL_INPUT_BIT_NEG_LIMIT = 0
+DIGITAL_INPUT_BIT_POS_LIMIT = 1
+
 # Ramp / jerk-limitation object dictionary entries (C5-E manual, chapter 10).
 OD_PROFILE_ACCELERATION = Nanolib.OdIndex(0x6083, 0x00)
 OD_PROFILE_DECELERATION = Nanolib.OdIndex(0x6084, 0x00)
@@ -252,7 +259,8 @@ class StatePoller:
         self._device_handle = device_handle
         self._interval_s = interval_s
         self._lock = threading.Lock()
-        self._state: dict = {"control_word": None, "status_word": None, "analog_input_1": None}
+        self._state: dict = {"control_word": None, "status_word": None, "analog_input_1": None,
+                              "neg_limit": None, "pos_limit": None}
         self._stop_event = threading.Event()
         self._thread = None
         self._last_analog_input_1 = None  # last accepted (post-clamp) value; owned by _run()
@@ -286,11 +294,16 @@ class StatePoller:
             control_word = self._read(OD_CONTROL_WORD)
             status_word = self._read(OD_STATUS_WORD)
             analog_input_1 = self._clamp_analog_jump(self._read(OD_ANALOG_INPUT_1))
+            digital_inputs = self._read(OD_DIGITAL_INPUTS)
+            neg_limit = None if digital_inputs is None else bool(digital_inputs & (1 << DIGITAL_INPUT_BIT_NEG_LIMIT))
+            pos_limit = None if digital_inputs is None else bool(digital_inputs & (1 << DIGITAL_INPUT_BIT_POS_LIMIT))
 
             with self._lock:
                 self._state["control_word"] = control_word
                 self._state["status_word"] = status_word
                 self._state["analog_input_1"] = analog_input_1
+                self._state["neg_limit"] = neg_limit
+                self._state["pos_limit"] = pos_limit
 
             self._stop_event.wait(self._interval_s)
 
@@ -319,13 +332,22 @@ class StatePoller:
         return raw
 
 
+def _format_limit(value):
+    if value is None:
+        return "?"
+    return "TRIGGERED" if value else "clear"
+
+
 def format_state_line(state, elapsed_s):
     cw = state["control_word"]
     sw = state["status_word"]
     ai = state["analog_input_1"]
     cw_str = f"0x{cw:04X}" if cw is not None else "?"
     sw_str = f"0x{sw:04X}" if sw is not None else "?"
-    return f"    [{elapsed_s:5.1f}s] Controlword={cw_str} Statusword={sw_str} AnalogInput1={ai}"
+    neg_str = _format_limit(state["neg_limit"])
+    pos_str = _format_limit(state["pos_limit"])
+    return (f"    [{elapsed_s:5.1f}s] Controlword={cw_str} Statusword={sw_str} AnalogInput1={ai} "
+            f"NegLimit={neg_str} PosLimit={pos_str}")
 
 
 def run_state_monitor(poller, log_interval_s=0.5):
