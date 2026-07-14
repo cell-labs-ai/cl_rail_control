@@ -42,6 +42,36 @@ document.getElementById("theme-toggle").addEventListener("click", () => {
 });
 updateThemeToggle(getTheme());
 
+// --- settings save / load ---------------------------------------------------
+
+const settingsStatus = document.getElementById("settings-status");
+let settingsStatusTimer = null;
+
+function flashSettingsStatus(ok, message) {
+  clearTimeout(settingsStatusTimer);
+  settingsStatus.textContent = message;
+  settingsStatus.className = "badge " + (ok ? "live" : "down");
+  settingsStatus.hidden = false;
+  settingsStatusTimer = setTimeout(() => { settingsStatus.hidden = true; }, 4000);
+}
+
+async function settingsAction(action) {
+  try {
+    const res = await api(`/api/settings/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    flashSettingsStatus(res.ok, res.message || (res.ok ? "ok" : "failed"));
+    if (res.ok) await poll();   // reflect any loaded values immediately
+  } catch (err) {
+    flashSettingsStatus(false, String(err));
+  }
+}
+
+document.getElementById("settings-save").addEventListener("click", () => settingsAction("save"));
+document.getElementById("settings-load").addEventListener("click", () => settingsAction("load"));
+
 const panels = {};   // name -> { root, inputs: {key: el}, readoutCells: {key: td}, flags, errLine }
 let config = null;
 

@@ -52,6 +52,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "nanolib_python_linux"))
 _WEBUI_DIR = os.path.join(_REPO_ROOT, "webui")
+_CONFIG_DIR = os.path.join(_REPO_ROOT, "config")
+_SETTINGS_FILE = os.path.join(_CONFIG_DIR, "settings.json")
 
 # nanolib is only importable on the target (aarch64) device and only needed
 # for real hardware; --simulate must work even where it can't be imported.
@@ -885,6 +887,50 @@ class ControllerManager:
     def get(self, name):
         return self.controllers.get(name)
 
+    # -- settings persistence (config/settings.json) -----------------------
+
+    def save_settings(self):
+        """Write every controller's current params to _SETTINGS_FILE,
+        creating config/ if it doesn't exist yet. Written via a temp file +
+        os.replace so a crash mid-write can't leave a truncated/corrupt file
+        behind for load_settings() to trip over."""
+        data = {name: ctrl.get_params() for name, ctrl in self.controllers.items()}
+        try:
+            os.makedirs(_CONFIG_DIR, exist_ok=True)
+            tmp_path = _SETTINGS_FILE + ".tmp"
+            with open(tmp_path, "w") as fh:
+                json.dump(data, fh, indent=2, sort_keys=True)
+            os.replace(tmp_path, _SETTINGS_FILE)
+        except OSError as exc:
+            return False, f"failed to save settings: {exc}"
+        return True, f"settings saved to {_SETTINGS_FILE}"
+
+    def load_settings(self):
+        """Load _SETTINGS_FILE (if present) onto the live controllers. Falls
+        back to whatever defaults are already in place (from PARAM_SPECS) if
+        the file is missing or malformed -- this must never raise, since it
+        also runs unattended at startup."""
+        if not os.path.isfile(_SETTINGS_FILE):
+            return False, "no settings file present; using defaults"
+        try:
+            with open(_SETTINGS_FILE) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return False, f"could not read settings file, using defaults: {exc}"
+        if not isinstance(data, dict):
+            return False, "settings file malformed, using defaults"
+
+        applied = 0
+        for name, params in data.items():
+            ctrl = self.controllers.get(name)
+            if ctrl is None or not isinstance(params, dict):
+                continue
+            for key, value in params.items():
+                ok, _message = ctrl.set_param(key, value)
+                if ok:
+                    applied += 1
+        return True, f"loaded {applied} parameter(s) from {_SETTINGS_FILE}"
+
     def shutdown(self):
         for ctrl in self.controllers.values():
             try:
@@ -931,6 +977,10 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     POST /api/<name>/enable
     POST /api/<name>/pid         -> {action: "start"|"stop"}
     POST /api/<name>/lift        -> {direction: "up"|"down"|"stop"}  (lift only)
+    POST /api/settings/save      -> writes current params of all controllers
+                                     to config/settings.json
+    POST /api/settings/load      -> re-reads config/settings.json and applies
+                                     it to the live controllers
     """
 
     manager = None  # set by run_server()
@@ -1019,6 +1069,18 @@ class RailRequestHandler(BaseHTTPRequestHandler):
         if len(parts) != 3 or parts[0] != "api":
             return self.send_error(404, "Unknown API endpoint")
         _api, name, action = parts
+
+        if name == "settings":
+            if action == "save":
+                ok, message = self.manager.save_settings()
+            elif action == "load":
+                ok, message = self.manager.load_settings()
+            else:
+                ok, message = False, f"unknown settings action '{action}'"
+            return self._send_json({"ok": ok, "message": message,
+                                    "controllers": self._snapshot()},
+                                   200 if ok else 400)
+
         ctrl = self.manager.get(name)
         if ctrl is None:
             return self._send_json({"ok": False, "error": f"no '{name}' controller"}, 404)
@@ -1097,6 +1159,8 @@ def main():
     if not manager.controllers:
         print("No controllers available. Exiting.")
         return 1
+    _ok, message = manager.load_settings()
+    print(message)
     run_server(manager, args.host, args.port)
     return 0
 

@@ -1,0 +1,26 @@
+{
+  "cart": {
+    "deadzone": 15,
+    "jog_accel": 600,
+    "jog_jerk": 4000,
+    "jog_speed": 400,
+    "kd": -0.05,
+    "ki": -0.01,
+    "kp": -4.5,
+    "max_speed": 600,
+    "pid_accel": 20000,
+    "pid_jerk": 20000
+  },
+  "lift": {
+    "deadzone": 15,
+    "jog_accel": 600,
+    "jog_jerk": 4000,
+    "jog_speed": 500,
+    "kd": -0.05,
+    "ki": -0.01,
+    "kp": -4.5,
+    "max_speed": 600,
+    "pid_accel": 20000,
+    "pid_jerk": 20000
+  }
+}
