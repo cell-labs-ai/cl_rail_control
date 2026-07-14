@@ -177,32 +177,44 @@ function buildPanel(ctrl) {
   const inputs = {};
   const valEls = {};
 
+  const params = ctrl.params || [];
+  const readout = ctrl.readout || [];
+
+  // The lift has no PID: drop the PID card and its status flag entirely.
+  const hasPid = params.some((spec) => spec.group === "pid");
+  if (!hasPid) {
+    root.querySelector(".pid-card").remove();
+    root.querySelector(".flag-pid").remove();
+  }
+
   // Split params between the PID card and the general Parameters card. In the
   // Parameters card, only jog speed stays visible; the rest collapse into a
   // "More parameters" disclosure that is closed by default.
   const paramsBox = root.querySelector(".params");
-  const pidBox = root.querySelector(".pid-params");
+  const pidBox = root.querySelector(".pid-params");   // null when there is no PID card
 
-  // Both cards keep their settings collapsed behind a "More parameters"
-  // disclosure. In the Parameters card jog speed stays visible; the PID card
-  // hides all its tuning behind the disclosure, leaving only Start/Stop.
+  // Both cards keep their settings collapsed behind a disclosure. In the
+  // Parameters card jog speed stays visible; the PID card hides all its tuning
+  // behind the disclosure, leaving only Start/Stop.
   const advanced = makeDisclosure("More parameters");
-  const pidAdvanced = makeDisclosure("PID settings");
+  const pidAdvanced = pidBox ? makeDisclosure("PID settings") : null;
 
-  for (const spec of config.params) {
+  for (const spec of params) {
     const { row, input, valEl } = makeParamRow(name, spec);
     inputs[spec.key] = input;
     if (valEl) valEls[spec.key] = valEl;
     if (spec.group === "pid") {
-      pidAdvanced.appendChild(row);
+      if (pidAdvanced) pidAdvanced.appendChild(row);
     } else if (ALWAYS_VISIBLE.has(spec.key)) {
       paramsBox.appendChild(row);
     } else {
       advanced.appendChild(row);
     }
   }
-  paramsBox.appendChild(advanced);
-  pidBox.appendChild(pidAdvanced);
+  // Only show the "More parameters" disclosure if it actually holds a row
+  // (a summary is its only child otherwise).
+  if (advanced.children.length > 1) paramsBox.appendChild(advanced);
+  if (pidBox && pidAdvanced) pidBox.appendChild(pidAdvanced);
 
   // Jog buttons (hold-to-jog).
   const labels = JOG_LABELS[ctrl.role] || JOG_LABELS.cart;
@@ -221,16 +233,18 @@ function buildPanel(ctrl) {
 
   root.querySelector(".estop").addEventListener("click", () => post(name, "stop", {}));
 
-  const pidToggle = root.querySelector(".pid-toggle");
-  pidToggle.addEventListener("click", () => {
-    const action = pidToggle.classList.contains("running") ? "stop" : "start";
-    post(name, "pid", { action });
-  });
+  const pidToggle = root.querySelector(".pid-toggle");   // null when there is no PID card
+  if (pidToggle) {
+    pidToggle.addEventListener("click", () => {
+      const action = pidToggle.classList.contains("running") ? "stop" : "start";
+      post(name, "pid", { action });
+    });
+  }
 
   // Readout rows.
   const tbody = root.querySelector(".readout tbody");
   const readoutCells = {};
-  for (const item of config.readout) {
+  for (const item of readout) {
     const tr = document.createElement("tr");
     const td1 = document.createElement("td");
     td1.textContent = item.label;
@@ -313,10 +327,14 @@ function updatePanel(name, data) {
     : (data.drive_enabled ? "enabled" : "idle");
   p.flags.drive.classList.toggle("on-drive", driving);
 
-  p.flags.pid.textContent = data.pid_running ? "PID on" : "PID off";
-  p.flags.pid.classList.toggle("on-pid", data.pid_running);
-  p.pidToggle.textContent = data.pid_running ? "Stop PID" : "Start PID";
-  p.pidToggle.classList.toggle("running", data.pid_running);
+  if (p.flags.pid) {
+    p.flags.pid.textContent = data.pid_running ? "PID on" : "PID off";
+    p.flags.pid.classList.toggle("on-pid", data.pid_running);
+  }
+  if (p.pidToggle) {
+    p.pidToggle.textContent = data.pid_running ? "Stop PID" : "Start PID";
+    p.pidToggle.classList.toggle("running", data.pid_running);
+  }
 
   // End stops (60FDh bit 0 = negative limit switch, bit 1 = positive limit
   // switch). Null (not yet read / unavailable) reads as clear, not triggered.

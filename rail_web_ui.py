@@ -15,12 +15,15 @@ numbers match. There is no way to target a device by IP directly (see the
 note in motion_test.py), so discovery-by-scan is the only path.
 
 The UI provides, per controller:
-  * a parameter section (dropdowns, number entries and sliders),
-  * PID gain tuning (Kp/Ki/Kd) with a start/stop for the software balance
-    loop, and
+  * a parameter section (jog controls), and
   * manual "hold to jog" drive buttons plus a STOP.
 
-The CART is fully wired up. The LIFT reuses the exact same readout, and its
+The CART carries the full set -- jog speed/acceleration/jerk plus PID gain
+tuning (Kp/Ki/Kd) with a start/stop for the software balance loop. The LIFT
+is pared down to just the jog speed: no jog accel/jerk, no PID, and no
+analog-angle readout.
+
+The CART is fully wired up. The LIFT reuses most of the readout, and its
 motion is templated (lift_up / lift_down) -- the drive is the same generic
 Profile Velocity move as the cart, with TODO markers where the real lift
 kinematics / travel limits / homing belong.
@@ -136,6 +139,13 @@ READOUT_SPECS = [
     ("digital_inputs", 0x60FD, 0x00, 32, False, "Digital Inputs (60FDh)", "hex"),
 ]
 
+# Per-role readout. The lift has no pendulum sensor, so it drops the analog
+# input row (and skips reading it on the bus). The cart keeps the full set.
+READOUT_SPECS_BY_ROLE = {
+    "cart": READOUT_SPECS,
+    "lift": [spec for spec in READOUT_SPECS if spec[0] != "analog_input_1"],
+}
+
 
 def _to_signed(value, bits):
     """Reinterpret an unsigned register value as signed (from test_controllers.py)."""
@@ -164,19 +174,20 @@ def _operation_enabled(status_word):
 # Parameter schema
 # ---------------------------------------------------------------------------
 #
-# The UI renders its parameter controls generically from this schema, so
-# adding a control -- or the lift's future parameters -- is a data change, not
-# a UI rewrite. Each spec has:
+# The UI renders its parameter controls generically from these schemas, so
+# adding a control is a data change, not a UI rewrite. Each spec has:
 #   key      : identifier used in the API
 #   label    : shown in the UI
 #   kind     : "select" | "number" | "slider"
 #   default  : initial value
 #   options  : [{value, label}, ...]           (select only)
 #   min/max/step                                (number/slider)
-#   od       : (index, sub, bits) written to the drive when changed, or
-#   od_jerk  : True  -> written to all four 60A4h subindices, or
 #   software : True  -> kept in software, pushed to the drive at mode start
 #   group    : "jog" | "pid" -> which set of controls it belongs to
+#
+# Each controller gets its own schema by role (PARAM_SPECS_BY_ROLE): the cart
+# exposes the jog speed plus the full PID tuning set, the lift exposes only the
+# jog speed (no PID) and with its own speed limits.
 
 # CiA 402 mode + ramp written whenever a drive is enabled. Both are fixed now
 # (the UI no longer exposes them): Profile Velocity with a jerk-limited ramp,
@@ -184,22 +195,29 @@ def _operation_enabled(status_word):
 DRIVE_MODE_PROFILE_VELOCITY = 3
 MOTION_PROFILE_JERK_LIMITED = 3
 
-# Shared parameter schema. The manual (jog) drive and the PID loop each carry
-# their OWN speed / acceleration / jerk, so tuning one never disturbs the
-# other. Every value is kept in software and pushed to the drive at the moment
-# that mode starts (see _apply_motion_profile). The PID gain defaults come
-# straight from motion_test.py.
-PARAM_SPECS = [
-    # --- Manual (hold-to-jog) drive ---
+# Manual (hold-to-jog) drive parameters. The cart carries its own speed,
+# acceleration and jerk (applied to the drive at the start of each jog). The
+# lift exposes only the jog speed -- and with its own speed limits -- leaving
+# its acceleration/jerk to whatever the drive is already configured with.
+JOG_SPECS_CART = [
     {"key": "jog_speed", "label": "Jog speed (rpm)", "kind": "slider", "group": "jog",
      "default": 400, "min": 50, "max": 700, "step": 10, "software": True},
     {"key": "jog_accel", "label": "Jog acceleration", "kind": "number", "group": "jog",
      "default": 1000, "min": 100, "max": 200000, "step": 100, "software": True},
     {"key": "jog_jerk", "label": "Jog jerk", "kind": "number", "group": "jog",
      "default": 12000, "min": 12000, "max": 200000, "step": 100, "software": True},
+]
+JOG_SPECS_LIFT = [
+    {"key": "jog_speed", "label": "Jog speed (rpm)", "kind": "slider", "group": "jog",
+     "default": 400, "min": 50, "max": 600, "step": 10, "software": True},
+]
 
-    # --- Software PID balance loop (see run_pid_loop / motion_test.py) ---
-    # The setpoint is not exposed in the UI; it is fixed at PID_SETPOINT below.
+# Software PID balance loop (cart only -- see run_pid_loop / motion_test.py).
+# Every value is kept in software and pushed to the drive when the loop starts
+# (see _apply_motion_profile). The setpoint is not exposed in the UI; it is
+# fixed at PID_SETPOINT below. The gain defaults come straight from
+# motion_test.py.
+PID_PARAM_SPECS = [
     {"key": "kp", "label": "Kp (rpm / digit)", "kind": "number", "group": "pid",
      "default": -4.5, "min": -50, "max": 50, "step": 0.1, "software": True},
     {"key": "ki", "label": "Ki (rpm / digit*s)", "kind": "number", "group": "pid",
@@ -215,6 +233,13 @@ PARAM_SPECS = [
     {"key": "pid_jerk", "label": "PID jerk", "kind": "number", "group": "pid",
      "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
 ]
+
+# Per-role parameter schema. The cart carries the PID tuning set; the lift is
+# jog-speed-only.
+PARAM_SPECS_BY_ROLE = {
+    "cart": JOG_SPECS_CART + PID_PARAM_SPECS,
+    "lift": JOG_SPECS_LIFT,
+}
 
 # PID loop constants that are not exposed as tunable params (from motion_test.py).
 # Angle the PID loop holds the pendulum at -- the middle of the analog range
@@ -255,12 +280,17 @@ class RailController:
         self._simulate = simulate
         self.connected = simulate or handle is not None
 
+        # Role-specific schemas (cart carries PID; lift is jog-speed-only and
+        # has no analog-angle readout).
+        self.param_specs = PARAM_SPECS_BY_ROLE[role]
+        self.readout_specs = READOUT_SPECS_BY_ROLE[role]
+
         # Live parameter values, seeded from the schema defaults.
-        self.params = {spec["key"]: spec["default"] for spec in PARAM_SPECS}
+        self.params = {spec["key"]: spec["default"] for spec in self.param_specs}
         self._params_lock = threading.Lock()
 
         # Latest readout snapshot (updated by the poller).
-        self._state = {key: None for (key, *_rest) in READOUT_SPECS}
+        self._state = {key: None for (key, *_rest) in self.readout_specs}
         self._state["neg_limit"] = None
         self._state["pos_limit"] = None
         self._state_lock = threading.Lock()
@@ -339,7 +369,7 @@ class RailController:
 
     def _read_state(self):
         snapshot = {}
-        for key, index, sub, bits, signed, _label, _fmt in READOUT_SPECS:
+        for key, index, sub, bits, signed, _label, _fmt in self.readout_specs:
             raw = self._read((index, sub, bits))
             if raw is None:
                 snapshot[key] = None
@@ -384,7 +414,7 @@ class RailController:
         """Validate + store a parameter. All params are software: the value is
         pushed to the drive when its mode starts (jog / PID apply their own
         speed / accel / jerk). Returns (ok, message)."""
-        spec = next((s for s in PARAM_SPECS if s["key"] == key), None)
+        spec = next((s for s in self.param_specs if s["key"] == key), None)
         if spec is None:
             return False, f"unknown parameter '{key}'"
 
@@ -408,8 +438,9 @@ class RailController:
 
     def _apply_motion_profile(self, accel, jerk):
         """Write 6083h/6084h (accel/decel) and all four 60A4h (jerk) subindices.
-        Called at the start of a jog or the PID loop so the manual drive and
-        the PID loop each ramp with their OWN acceleration/jerk."""
+        Called at the start of a cart jog or the PID loop so each ramps with
+        its OWN acceleration/jerk. The lift jog has no accel/jerk params, so it
+        skips this and leaves the drive's configured ramp untouched."""
         if self._simulate:
             return True
         self._write(OD_PROFILE_ACCELERATION, accel)
@@ -574,7 +605,10 @@ class RailController:
         if not self._ensure_operation_enabled():
             return False, self.last_error or "failed to enable drive"
         p = self.get_params()
-        self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
+        # The cart ramps with its own jog accel/jerk; the lift has none of
+        # those params and leaves the drive's configured ramp untouched.
+        if "jog_accel" in p and "jog_jerk" in p:
+            self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
         if not self.set_target_velocity(direction * p["jog_speed"]):
             return False, self.last_error or "failed to set velocity"
         self.jog_direction = direction
@@ -606,6 +640,8 @@ class RailController:
     # -- software PID balance loop (from motion_test.run_position_control) --
 
     def start_pid(self):
+        if not any(spec["group"] == "pid" for spec in self.param_specs):
+            return False, f"PID not available for the {self.name}"
         if self.pid_running:
             return True, "already running"
         if not self._ensure_operation_enabled():
@@ -879,7 +915,7 @@ class ControllerManager:
 
     def load_settings(self):
         """Load _SETTINGS_FILE (if present) onto the live controllers. Falls
-        back to whatever defaults are already in place (from PARAM_SPECS) if
+        back to whatever defaults are already in place (from the role schema) if
         the file is missing or malformed -- this must never raise, since it
         also runs unattended at startup."""
         if not os.path.isfile(_SETTINGS_FILE):
@@ -1017,13 +1053,17 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             return self._send_static("index.html")
         if path == "/api/config":
             return self._send_json({
-                "params": PARAM_SPECS,
-                "readout": [
-                    {"key": k, "label": lbl, "fmt": fmt}
-                    for (k, _i, _s, _b, _sg, lbl, fmt) in READOUT_SPECS
-                ],
                 "controllers": [
-                    {"name": name, "suffix": ctrl.serial_suffix, "role": ctrl.role}
+                    {
+                        "name": name,
+                        "suffix": ctrl.serial_suffix,
+                        "role": ctrl.role,
+                        "params": ctrl.param_specs,
+                        "readout": [
+                            {"key": k, "label": lbl, "fmt": fmt}
+                            for (k, _i, _s, _b, _sg, lbl, fmt) in ctrl.readout_specs
+                        ],
+                    }
                     for name, ctrl in self.manager.controllers.items()
                 ],
                 "simulate": self.manager.simulate,
