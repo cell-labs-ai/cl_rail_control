@@ -682,6 +682,15 @@ class RailController:
         output clamped to +/- max_speed. The gains are read live from params
         every iteration, so the UI retunes it on the fly; the setpoint is
         fixed (PID_SETPOINT) and no longer part of the UI.
+
+        End stops: unlike jog(), the PID output can swing into a limit
+        switch mid-run rather than only when a fixed direction is first
+        commanded, so this checks on every iteration instead of only at
+        start_pid(). Uses the poller's cached state (cheap, no bus round
+        trip) to clamp velocity away from a triggered switch and to detect
+        Quick stop active; _ensure_operation_enabled() -- with its own
+        fresh read -- is only actually invoked (bus round trip(s)) when
+        that cached state suggests it's needed.
         """
         integral = 0.0
         filtered_rate = 0.0
@@ -718,6 +727,14 @@ class RailController:
                             + p["ki"] * integral
                             + p["kd"] * filtered_rate)
                 velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
+                if state.get("pos_limit") and velocity > 0:
+                    velocity = 0
+                if state.get("neg_limit") and velocity < 0:
+                    velocity = 0
+
+                if _quick_stop_active(state.get("status_word")):
+                    self._ensure_operation_enabled()
+
                 self.set_target_velocity(round(velocity))
 
             self._pid_stop.wait(PID_INTERVAL_S)
