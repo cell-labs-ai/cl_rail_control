@@ -95,23 +95,18 @@ OD_DIGITAL_INPUTS = (0x60FD, 0x00, 32)
 DIGITAL_INPUT_BIT_NEG_LIMIT = 0
 DIGITAL_INPUT_BIT_POS_LIMIT = 1
 
-# Limit Switch Error Option Code (3701h) and Quick Stop Option Code (605Ah):
-# both involved in recovering from a limit-switch-triggered Quick stop
-# active -- see RailController._recover_from_endstop() for why.
-OD_LIMIT_SWITCH_OPTION = (0x3701, 0x00, 16)
-LIMIT_SWITCH_OPTION_DISCARD = -2   # "no reaction, discard the limit switch position"
-OD_QUICK_STOP_OPTION = (0x605A, 0x00, 16)
-QUICK_STOP_OPTION_STAY_ENABLED = 6  # "quick stop ramp, stay energized in Quick stop active"
-
 # Statusword (6041h) state-machine mask/pattern (see decodeStatusword() in
 # app.js for the full state table).
 STATUSWORD_STATE_MASK = 0x6F
 STATUSWORD_QUICK_STOP_ACTIVE = 0x07
 STATUSWORD_OPERATION_ENABLED = 0x27
 
-# How many times _ensure_operation_enabled() retries the endstop recovery
-# sequence before falling back to enable_drive() -- see that method.
-ENDSTOP_RECOVERY_ATTEMPTS = 8
+# _ensure_operation_enabled() polls the statusword until the CiA-402 state
+# machine has worked through its enable transitions (each takes a controller
+# cycle), so it doesn't race ahead of the drive. Bounded by the timeout so a
+# stuck drive can't hang the request thread.
+ENABLE_TIMEOUT_S = 1.0
+ENABLE_POLL_S = 0.01
 
 OD_PROFILE_ACCELERATION = (0x6083, 0x00, 32)
 OD_PROFILE_DECELERATION = (0x6084, 0x00, 32)
@@ -270,15 +265,6 @@ class RailController:
         self._state["pos_limit"] = None
         self._state_lock = threading.Lock()
         self._last_analog = None
-        # 3701h value saved while temporarily overridden to -2 during end
-        # stop recovery (see _recover_from_endstop()); None means no
-        # override is active. Restored by _read_state() as soon as the
-        # limit switch physically clears.
-        self._limit_switch_option_saved = None
-        # True once 605Ah has been confirmed set to
-        # QUICK_STOP_OPTION_STAY_ENABLED this session (see
-        # _recover_from_endstop()); avoids re-writing it on every recovery.
-        self._quick_stop_option_configured = False
 
         # Drive / status flags surfaced to the UI.
         self.drive_enabled = False          # Profile Velocity mode + operation enabled
@@ -371,14 +357,6 @@ class RailController:
             snapshot["neg_limit"] = bool(digital_inputs & (1 << DIGITAL_INPUT_BIT_NEG_LIMIT))
             snapshot["pos_limit"] = bool(digital_inputs & (1 << DIGITAL_INPUT_BIT_POS_LIMIT))
 
-        # Once both switches read definitively clear (not just unknown -- a
-        # failed read must not be mistaken for "released"), restore the
-        # option code _recover_from_endstop() overrode to -2, re-arming end
-        # stop protection for the axis.
-        if (self._limit_switch_option_saved is not None
-                and snapshot["neg_limit"] is False and snapshot["pos_limit"] is False):
-            if self._write(OD_LIMIT_SWITCH_OPTION, self._limit_switch_option_saved):
-                self._limit_switch_option_saved = None
         return snapshot
 
     def _clamp_analog_jump(self, raw):
@@ -460,107 +438,84 @@ class RailController:
         return True
 
     def _recover_from_endstop(self):
-        """Bring the drive from 'Quick stop active' (forced by a triggered
-        limit switch, see C5-E manual chapter 5.4) back to 'Operation
-        enabled', per the manual's recipe under 3701h ("Discarding the
-        limit switch position"):
+        """Return the drive from 'Quick stop active' (forced by a triggered
+        limit switch) to 'Operation enabled' without commanding motion, per
+        the C5-E manual chapter 5.4. Returns the last statusword read.
 
-        1. Fix 605Ah (Quick Stop Option Code) to
-           QUICK_STOP_OPTION_STAY_ENABLED first. Its default (2, "brake
-           then Switch on disabled") governs what a controlword quick-stop
-           command does -- and step 2 below issues exactly that -- so
-           without this fix, step 2 doesn't just manufacture a harmless
-           edge, it re-triggers a real switch-off on top of whatever the
-           limit switch already did.
-        2. A 0 -> 1 edge on controlword bit 2 (quick stop): the manual is
-           explicit that this bit is left untouched when a limit switch
-           triggers the state change, so the normal enable sequence
-           (0x06 -> 0x07 -> 0x0F, all of which already have bit 2 set) has
-           no effect. Force it low (0x02) then request Enable Operation
-           (0x0F), whose bit 2 now rises.
-        3. Discard the noted limit-switch position (3701h = -2), or the
-           drive re-applies its configured reaction against the
-           still-triggered switch and trips straight back down. The device
-           rejects this write while still literally in Quick stop active,
-           hence it comes after the edge, not before -- which leaves a
-           race the caller (_ensure_operation_enabled()) retries.
+        Recovery is a 0 -> 1 edge on controlword bit 2 (quick stop): a
+        triggered limit switch leaves this bit untouched (it's still high from
+        normal operation), so force it low (0x02) then request Enable Operation
+        (0x0F), whose bit 2 rises -- CiA-402 transition 16. Bit 4 stays 0 and
+        target velocity is held at 0, so nothing moves.
 
-        Target velocity is held at 0 throughout, so nothing moves until the
-        caller (jog(), already restricted to the direction away from the
-        triggered switch) commands it. _read_state() restores the saved
-        3701h value once both switches read clear.
+        The edge is re-issued until the drive actually reports Operation
+        enabled (bounded by ENABLE_TIMEOUT_S), because the drive finishes its
+        quick-stop deceleration ramp before accepting the transition: a single
+        edge issued while the cart is still braking is consumed without a state
+        change, and once it coasts to standstill bit 2 is already high again,
+        so there is no fresh edge -- it stays stuck in Quick stop active. That
+        is what made the first jog after an endstop fail; re-issuing the edge
+        lands the transition on the first cycle after standstill.
+
+        Assumes 605Ah (Quick Stop Option Code) is already configured on the
+        drive to keep the motor energized in Quick stop active, so forcing
+        bit 2 low doesn't switch it off.
         """
         if self._simulate:
             self.drive_enabled = True
-            return True
-
-        if not self._quick_stop_option_configured:
-            if self._write(OD_QUICK_STOP_OPTION, QUICK_STOP_OPTION_STAY_ENABLED):
-                self._quick_stop_option_configured = True
+            return STATUSWORD_OPERATION_ENABLED
 
         self._write(OD_TARGET_VELOCITY, 0)
 
-        if not self._write(OD_CONTROL_WORD, 0x02):   # force quick-stop bit low
-            return False
-        if not self._write(OD_CONTROL_WORD, 0x0F):   # rising edge -> operation enabled
-            return False
+        deadline = time.monotonic() + ENABLE_TIMEOUT_S
+        while True:
+            self._write(OD_CONTROL_WORD, 0x02)   # force quick-stop bit low
+            self._write(OD_CONTROL_WORD, 0x0F)   # rising edge -> operation enabled
+            status_word = self._read(OD_STATUS_WORD)
+            if _operation_enabled(status_word) or time.monotonic() >= deadline:
+                return status_word
+            time.sleep(ENABLE_POLL_S)
 
-        if self._limit_switch_option_saved is None:
-            saved = self._read(OD_LIMIT_SWITCH_OPTION)
-            # Fall back to 6 (this axis's evident config) on a failed read,
-            # so there's still a sane value to restore once clear.
-            self._limit_switch_option_saved = 6 if saved is None else saved
-        if not self._write(OD_LIMIT_SWITCH_OPTION, LIMIT_SWITCH_OPTION_DISCARD):
-            return False
-        return True
+    def _wait_for_operation_enabled(self):
+        """Poll statusword (6041h) until the drive reports 'Operation enabled',
+        giving the CiA-402 state machine time to work through its shutdown ->
+        switch on -> enable operation transitions (each takes a controller
+        cycle). Returns the last statusword read; gives up after
+        ENABLE_TIMEOUT_S so a stuck read can't hang the request thread."""
+        deadline = time.monotonic() + ENABLE_TIMEOUT_S
+        while True:
+            status_word = self._read(OD_STATUS_WORD)
+            if _operation_enabled(status_word) or time.monotonic() >= deadline:
+                return status_word
+            time.sleep(ENABLE_POLL_S)
 
     def _ensure_operation_enabled(self):
         """Make sure the drive is in 'Operation enabled' before jogging or
-        starting the PID loop, recovering from a limit-switch-triggered
-        'Quick stop active' if necessary.
-
-        Always checks a *fresh* statusword read, never the poller's
-        up-to-STATE_POLL_INTERVAL_S-old snapshot: _recover_from_endstop()'s
-        edge races the drive's own re-evaluation of the still-triggered
-        switch and doesn't reliably land in Operation enabled on the first
-        try (it can bounce to Switch on disabled, or its 3701h write can be
-        rejected outright -- see that method). So this retries it up to
-        ENDSTOP_RECOVERY_ATTEMPTS times while still stuck in Quick stop
-        active, then falls through to the plain enable_drive() sequence,
-        which reliably works from wherever the drive settled once it's no
-        longer literally in that state.
-        """
+        starting the PID loop. Recovers from a limit-switch-triggered 'Quick
+        stop active' via _recover_from_endstop(); otherwise runs the normal
+        enable_drive() sequence and waits for it to land. Both paths wait for
+        the state machine to actually reach Operation enabled rather than
+        racing a single read ahead of the drive (that race is why jog used to
+        need two clicks). Uses fresh statusword reads, never the poller's
+        up-to-STATE_POLL_INTERVAL_S-old snapshot."""
         if self._simulate:
             self.drive_enabled = True
             return True
 
         status_word = self._read(OD_STATUS_WORD)
-        if _operation_enabled(status_word):
-            self.last_error = None
-            self.drive_enabled = True
-            return True
 
         if _quick_stop_active(status_word):
-            for _attempt in range(ENDSTOP_RECOVERY_ATTEMPTS):
-                self._recover_from_endstop()
-                status_word = self._read(OD_STATUS_WORD)
-                if not _quick_stop_active(status_word):
-                    break
-
-        if not _operation_enabled(status_word):
+            status_word = self._recover_from_endstop()
+        elif not _operation_enabled(status_word):
             if not self.enable_drive():
                 return False
-            status_word = self._read(OD_STATUS_WORD)
+            status_word = self._wait_for_operation_enabled()
 
         if not _operation_enabled(status_word):
             self.last_error = "drive did not reach Operation enabled"
             self.drive_enabled = False
             return False
 
-        # A losing retry attempt above may have left a transient SDO error
-        # (e.g. the expected-and-retried 3701h rejection) in last_error even
-        # though we ultimately got here; don't leave that stale message
-        # displayed once we're actually back in Operation enabled.
         self.last_error = None
         self.drive_enabled = True
         return True
