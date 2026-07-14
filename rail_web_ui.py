@@ -192,11 +192,11 @@ MOTION_PROFILE_JERK_LIMITED = 3
 PARAM_SPECS = [
     # --- Manual (hold-to-jog) drive ---
     {"key": "jog_speed", "label": "Jog speed (rpm)", "kind": "slider", "group": "jog",
-     "default": 500, "min": 0, "max": 800, "step": 10, "software": True},
+     "default": 400, "min": 50, "max": 700, "step": 10, "software": True},
     {"key": "jog_accel", "label": "Jog acceleration", "kind": "number", "group": "jog",
-     "default": 600, "min": 0, "max": 200000, "step": 100, "software": True},
+     "default": 1000, "min": 100, "max": 200000, "step": 100, "software": True},
     {"key": "jog_jerk", "label": "Jog jerk", "kind": "number", "group": "jog",
-     "default": 4000, "min": 0, "max": 200000, "step": 100, "software": True},
+     "default": 12000, "min": 12000, "max": 200000, "step": 100, "software": True},
 
     # --- Software PID balance loop (see run_pid_loop / motion_test.py) ---
     # The setpoint is not exposed in the UI; it is fixed at PID_SETPOINT below.
@@ -211,9 +211,9 @@ PARAM_SPECS = [
     {"key": "max_speed", "label": "PID max speed (rpm)", "kind": "slider", "group": "pid",
      "default": 600, "min": 0, "max": 800, "step": 10, "software": True},
     {"key": "pid_accel", "label": "PID acceleration", "kind": "number", "group": "pid",
-     "default": 20000, "min": 0, "max": 200000, "step": 100, "software": True},
+     "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
     {"key": "pid_jerk", "label": "PID jerk", "kind": "number", "group": "pid",
-     "default": 20000, "min": 0, "max": 200000, "step": 100, "software": True},
+     "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
 ]
 
 # PID loop constants that are not exposed as tunable params (from motion_test.py).
