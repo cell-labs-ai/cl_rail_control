@@ -204,8 +204,7 @@ main {
   -webkit-user-select: none;
   touch-action: none;
 }
-.jog.btn-neg { background: var(--tech-orange); }
-.jog.btn-pos { background: var(--status-ready); }
+.jog.btn-neg, .jog.btn-pos { background: var(--status-ready); }
 .jog:active { filter: brightness(1.1); transform: scale(0.97); }
 .jog:disabled { background: var(--status-off); cursor: not-allowed; box-shadow: none; }
 .estop { flex: 0 0 90px; background: var(--status-error); letter-spacing: 1px; }
