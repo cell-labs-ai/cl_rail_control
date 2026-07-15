@@ -438,6 +438,18 @@ function fmtReadout(fmt, value) {
   if (fmt === "statusword") return `${decodeStatusword(value)} (${toHex(value)})`;
   if (fmt === "controlword") return `${decodeControlword(value)} (${toHex(value)})`;
   if (fmt === "hex" && typeof value === "number") return toHex(value);
+  // Brake output (60FEh:01h bit 0): "1" = brake activated/closed, "0" = released.
+  if (fmt === "brake" && typeof value === "number") {
+    return (value & 1) ? "CLOSED (1)" : "released (0)";
+  }
+  // Digital inputs (60FDh) as endstops: bit 0 = negative limit switch, bit 1 =
+  // positive limit switch. Show which (if any) are triggered.
+  if (fmt === "endstops" && typeof value === "number") {
+    const triggered = [];
+    if (value & 0x1) triggered.push("NEG");
+    if (value & 0x2) triggered.push("POS");
+    return triggered.length ? triggered.join(" + ") + " triggered" : "clear";
+  }
   return String(value);
 }
 

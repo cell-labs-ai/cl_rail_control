@@ -100,6 +100,18 @@ OD_DIGITAL_INPUTS = (0x60FD, 0x00, 32)
 DIGITAL_INPUT_BIT_NEG_LIMIT = 0
 DIGITAL_INPUT_BIT_POS_LIMIT = 1
 
+# Digital Outputs (60FEh:01h "Physical Outputs"): bit 0 = BRK, the brake output
+# -- value "1" means the brake is activated (closed, no current flows), "0"
+# means released. See C5-E manual chapter 10 "60FEh Digital Outputs".
+OD_DIGITAL_OUTPUTS = (0x60FE, 0x01, 32)
+DIGITAL_OUTPUT_BIT_BRAKE = 0
+
+# Motor Currents (2039h:05h "Actual Current"): the total motor current in mA,
+# calculated down to one phase (total / sqrt(2)); in closed-loop it carries the
+# sign of Iq. INTEGER32 (signed). See C5-E manual chapter 10 "2039h Motor
+# Currents". Comparable to the current from 6075h/2031h/203Bh:05h.
+OD_MOTOR_CURRENT_ACTUAL = (0x2039, 0x05, 32)
+
 # Statusword (6041h) state-machine mask/pattern (see decodeStatusword() in
 # app.js for the full state table).
 STATUSWORD_STATE_MASK = 0x6F
@@ -138,13 +150,16 @@ READOUT_SPECS = [
     ("error_count", 0x1003, 0x00, 8, False, "Error count", None),
     ("analog_input_1", 0x3220, 0x01, 16, False, "Analog Input 1 (angle)", None),
     ("control_word", 0x6040, 0x00, 16, False, "Command (6040h)", "controlword"),
-    ("digital_inputs", 0x60FD, 0x00, 32, False, "Digital Inputs (60FDh)", "hex"),
+    ("digital_inputs", 0x60FD, 0x00, 32, False, "Endstops (60FDh)", "endstops"),
+    ("digital_outputs", 0x60FE, 0x01, 32, False, "Brake output (60FEh:01h bit 0)", "brake"),
+    ("motor_current", 0x2039, 0x05, 32, True, "Actual Current (mA)", None),
 ]
 
 # Per-role readout. The lift has no pendulum sensor, so it drops the analog
-# input row (and skips reading it on the bus). The cart keeps the full set.
+# input row (and skips reading it on the bus). The cart has no brake, so it
+# drops the brake output row; the lift keeps it (its load-holding brake).
 READOUT_SPECS_BY_ROLE = {
-    "cart": READOUT_SPECS,
+    "cart": [spec for spec in READOUT_SPECS if spec[0] != "digital_outputs"],
     "lift": [spec for spec in READOUT_SPECS if spec[0] != "analog_input_1"],
 }
 
@@ -806,6 +821,9 @@ class RailController:
 
         # 6041h: operation-enabled (0x0637) vs switch-on-disabled (0x0640).
         status_word = 0x0637 if self.drive_enabled else 0x0640
+        # Brake (60FEh:01h bit 0) tracks the drive: released while enabled,
+        # engaged (closed) when idle, so the sim shows the bit toggling.
+        digital_outputs = 0 if self.drive_enabled else (1 << DIGITAL_OUTPUT_BIT_BRAKE)
         # No physical limit switches to simulate; report both clear.
         return {
             "status_word": status_word,
@@ -815,6 +833,9 @@ class RailController:
             "analog_input_1": int(self._sim_angle),
             "control_word": 0x000F if self.drive_enabled else 0x0006,
             "digital_inputs": 0,
+            "digital_outputs": digital_outputs,
+            # Actual Current (2039h:05h) in mA; roughly proportional to velocity.
+            "motor_current": int(self._sim_velocity * 2.0),
             "neg_limit": False,
             "pos_limit": False,
         }
