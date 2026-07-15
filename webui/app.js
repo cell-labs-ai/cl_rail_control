@@ -302,6 +302,22 @@ function makeJoystick(name, role) {
   return joy;
 }
 
+// Lock a flag's min-width to its widest possible label so that later text
+// changes (e.g. "enabled" -> "driving +") never resize the flag and reflow
+// the row it sits in. Must run after the element is attached to the
+// document, since it measures rendered width.
+function lockFlagWidth(el, candidates) {
+  if (!el) return;
+  const original = el.textContent;
+  let widest = 0;
+  for (const text of candidates) {
+    el.textContent = text;
+    widest = Math.max(widest, el.getBoundingClientRect().width);
+  }
+  el.textContent = original;
+  el.style.minWidth = `${Math.ceil(widest)}px`;
+}
+
 function buildPanel(ctrl) {
   const name = ctrl.name;
   const tpl = document.getElementById("panel-template").content.cloneNode(true);
@@ -384,6 +400,18 @@ function buildPanel(ctrl) {
   }
 
   panelsEl.appendChild(tpl);
+
+  const flagConn = root.querySelector(".flag-conn");
+  const flagDrive = root.querySelector(".flag-drive");
+  const flagPid = root.querySelector(".flag-pid");
+  const flagNegLimit = root.querySelector(".flag-neg-limit");
+  const flagPosLimit = root.querySelector(".flag-pos-limit");
+  lockFlagWidth(flagConn, ["online", "offline"]);
+  lockFlagWidth(flagDrive, ["driving +", "driving -", "enabled", "idle"]);
+  lockFlagWidth(flagPid, ["PID on", "PID off"]);
+  lockFlagWidth(flagNegLimit, ["neg endstop", "NEG ENDSTOP"]);
+  lockFlagWidth(flagPosLimit, ["pos endstop", "POS ENDSTOP"]);
+
   panels[name] = {
     root,
     inputs,
@@ -391,11 +419,11 @@ function buildPanel(ctrl) {
     readoutCells,
     joystick,
     flags: {
-      conn: root.querySelector(".flag-conn"),
-      drive: root.querySelector(".flag-drive"),
-      pid: root.querySelector(".flag-pid"),
-      negLimit: root.querySelector(".flag-neg-limit"),
-      posLimit: root.querySelector(".flag-pos-limit"),
+      conn: flagConn,
+      drive: flagDrive,
+      pid: flagPid,
+      negLimit: flagNegLimit,
+      posLimit: flagPosLimit,
     },
     pidToggle,
     errLine: root.querySelector(".err-line"),

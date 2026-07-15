@@ -154,6 +154,7 @@ main {
 .panel-flags { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 .flag {
+  display: inline-block;
   font-size: 0.7rem;
   font-weight: 600;
   padding: 0.25rem 0.625rem;
@@ -163,7 +164,12 @@ main {
   color: var(--text-muted);
   text-transform: uppercase;
   letter-spacing: 0.03em;
+  text-align: center;
+  white-space: nowrap;
 }
+/* min-width is set per-element in app.js (lockFlagWidth), measured from the
+   widest label each flag can show, so text changing (e.g. the drive
+   direction) never resizes the flag and reflows the row. */
 .flag.on-conn { color: var(--status-ready); border-color: var(--status-ready); }
 .flag.on-drive { color: var(--status-info); border-color: var(--status-info); }
 .flag.on-pid { color: var(--status-warn); border-color: var(--status-warn); }
