@@ -16,12 +16,14 @@ note in motion_test.py), so discovery-by-scan is the only path.
 
 The UI provides, per controller:
   * a parameter section (jog controls), and
-  * manual "hold to jog" drive buttons plus a STOP.
+  * a spring-return one-axis joystick for manual drive plus a STOP.
 
-The CART carries the full set -- jog speed/acceleration/jerk plus PID gain
-tuning (Kp/Ki/Kd) with a start/stop for the software balance loop. The LIFT
-is pared down to just the jog speed: no jog accel/jerk, no PID, and no
-analog-angle readout.
+The manual drive is a joystick: stick displacement sets the target velocity
+(0 at centre, +/- the full-scale joy speed at the ends), springing back to
+zero when released. The CART carries the full set -- joy max speed plus
+acceleration/jerk, plus PID gain tuning (Kp/Ki/Kd) with a start/stop for the
+software balance loop. The LIFT is pared down to just the joy max speed: no
+jog accel/jerk, no PID, and no analog-angle readout.
 
 The CART is fully wired up. The LIFT reuses most of the readout, and its
 motion is templated (lift_up / lift_down) -- the drive is the same generic
@@ -195,21 +197,24 @@ def _operation_enabled(status_word):
 DRIVE_MODE_PROFILE_VELOCITY = 3
 MOTION_PROFILE_JERK_LIMITED = 3
 
-# Manual (hold-to-jog) drive parameters. The cart carries its own speed,
-# acceleration and jerk (applied to the drive at the start of each jog). The
-# lift exposes only the jog speed -- and with its own speed limits -- leaving
-# its acceleration/jerk to whatever the drive is already configured with.
+# Manual (joystick) drive parameters. The manual drive is a spring-return
+# one-axis joystick: stick displacement sets the target velocity directly, so
+# jog_speed is the joystick's FULL-SCALE speed (velocity at the ends of travel),
+# not a fixed jog speed. The cart also carries its own acceleration and jerk
+# (applied to the drive when a push engages the ramp). The lift exposes only
+# the full-scale speed -- with its own limit -- leaving its acceleration/jerk to
+# whatever the drive is already configured with.
 JOG_SPECS_CART = [
-    {"key": "jog_speed", "label": "Jog speed (rpm)", "kind": "slider", "group": "jog",
-     "default": 400, "min": 50, "max": 700, "step": 10, "software": True},
+    {"key": "jog_speed", "label": "Joy max speed (rpm)", "kind": "slider", "group": "jog",
+     "default": 700, "min": 50, "max": 700, "step": 10, "software": True},
     {"key": "jog_accel", "label": "Jog acceleration", "kind": "number", "group": "jog",
      "default": 1000, "min": 100, "max": 200000, "step": 100, "software": True},
     {"key": "jog_jerk", "label": "Jog jerk", "kind": "number", "group": "jog",
      "default": 12000, "min": 12000, "max": 200000, "step": 100, "software": True},
 ]
 JOG_SPECS_LIFT = [
-    {"key": "jog_speed", "label": "Jog speed (rpm)", "kind": "slider", "group": "jog",
-     "default": 400, "min": 50, "max": 600, "step": 10, "software": True},
+    {"key": "jog_speed", "label": "Joy max speed (rpm)", "kind": "slider", "group": "jog",
+     "default": 400, "min": 50, "max": 500, "step": 10, "software": True},
 ]
 
 # Software PID balance loop (cart only -- see run_pid_loop / motion_test.py).
@@ -614,6 +619,57 @@ class RailController:
         self.jog_direction = direction
         return True, "ok"
 
+    def jog_velocity(self, velocity):
+        """Joystick drive: command an arbitrary signed target velocity (rpm),
+        whose magnitude is how far the stick is pushed. 0 releases the stick
+        (ramp to zero, stay enabled) so the next push responds immediately.
+
+        The magnitude is clamped to the configured full-scale joy speed
+        (jog_speed). End-stop and PID gating match jog(): a triggered limit
+        switch only blocks the direction that drove into it.
+
+        Engagement is lazy: the CiA-402 enable + motion-profile writes only run
+        when starting from rest or reversing across zero, so the stream of
+        small updates a dragged stick produces is just a target-velocity write
+        each -- not a full re-enable every time."""
+        try:
+            velocity = int(round(float(velocity)))
+        except (TypeError, ValueError):
+            return False, f"invalid velocity {velocity!r}"
+        if self.pid_running:
+            return False, "stop the PID loop before jogging"
+
+        # Clamp magnitude to the full-scale joy speed so the stick can never
+        # command more than the configured maximum.
+        limit = int(self.get_params().get("jog_speed", 0))
+        velocity = max(-limit, min(limit, velocity))
+
+        direction = (velocity > 0) - (velocity < 0)
+        if direction == 0:
+            return self.jog_stop()
+
+        state = self.get_state()
+        if direction > 0 and state.get("pos_limit"):
+            self.last_error = "positive end stop triggered -- only negative direction allowed"
+            return False, self.last_error
+        if direction < 0 and state.get("neg_limit"):
+            self.last_error = "negative end stop triggered -- only positive direction allowed"
+            return False, self.last_error
+
+        # Only run the (heavy) enable + ramp setup when engaging from rest or
+        # reversing direction; a same-direction update is just a velocity write.
+        if self.jog_direction != direction:
+            if not self._ensure_operation_enabled():
+                return False, self.last_error or "failed to enable drive"
+            p = self.get_params()
+            if "jog_accel" in p and "jog_jerk" in p:
+                self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
+
+        if not self.set_target_velocity(velocity):
+            return False, self.last_error or "failed to set velocity"
+        self.jog_direction = direction
+        return True, "ok"
+
     def jog_stop(self):
         """Release jog: ramp to zero but stay in operation enabled so the next
         press responds immediately."""
@@ -980,6 +1036,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     GET  /api/state              -> live readout + params + flags for both
     POST /api/<name>/param       -> {key, value}
     POST /api/<name>/jog         -> {direction: -1|0|1}
+    POST /api/<name>/jog_velocity-> {velocity: signed rpm}  (joystick drive)
     POST /api/<name>/jog_stop
     POST /api/<name>/stop
     POST /api/<name>/enable
@@ -1112,6 +1169,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             return ctrl.set_param(body.get("key"), body.get("value"))
         if action == "jog":
             return ctrl.jog(body.get("direction", 0))
+        if action == "jog_velocity":
+            return ctrl.jog_velocity(body.get("velocity", 0))
         if action == "jog_stop":
             return ctrl.jog_stop()
         if action == "stop":

@@ -186,28 +186,114 @@ main {
   color: var(--text-muted);
 }
 
-/* Manual drive */
-.jog-row { display: flex; gap: 0.75rem; align-items: stretch; }
-.jog, .estop {
-  flex: 1;
+/* Manual drive: spring-return one-axis joystick */
+.joystick {
+  display: grid;
+  align-items: center;
+  justify-items: center;
+  gap: 0.5rem;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+/* Horizontal (cart): [-] [track] [+] on one row, value below. */
+.joystick[data-axis="x"] {
+  grid-template-columns: auto 1fr auto;
+  grid-template-areas: "neg track pos" "value value value";
+}
+/* Vertical (lift): [+] on top, track, [-] below, value below. */
+.joystick[data-axis="y"] {
+  grid-template-columns: 1fr;
+  grid-template-areas: "pos" "track" "neg" "value";
+  justify-items: center;
+}
+.joy-end {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.joy-end-neg { grid-area: neg; }
+.joy-end-pos { grid-area: pos; }
+.joy-value {
+  grid-area: value;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.8125rem;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+.joy-value.active { color: var(--status-info); font-weight: 600; }
+
+.joy-track {
+  grid-area: track;
+  position: relative;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  cursor: grab;
+  touch-action: none;
+}
+.joy-track.dragging { cursor: grabbing; }
+/* A centre tick to mark the zero position. */
+.joy-track::before {
+  content: "";
+  position: absolute;
+  background: var(--border);
+}
+.joystick[data-axis="x"] .joy-track {
+  width: 100%;
+  height: 3rem;
+}
+.joystick[data-axis="x"] .joy-track::before {
+  left: 50%; top: 20%; bottom: 20%; width: 2px; transform: translateX(-50%);
+}
+.joystick[data-axis="y"] .joy-track {
+  width: 3rem;
+  height: 11rem;
+}
+.joystick[data-axis="y"] .joy-track::before {
+  top: 50%; left: 20%; right: 20%; height: 2px; transform: translateY(-50%);
+}
+
+.joy-handle {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 2.4rem;
+  height: 2.4rem;
+  border-radius: 50%;
+  background: var(--status-ready);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+/* --pos is the signed fraction of travel [-1, 1]; 46% keeps the handle inside
+   the track at the extremes. */
+.joystick[data-axis="x"] .joy-handle { left: calc(50% + var(--pos, 0) * 46%); }
+.joystick[data-axis="y"] .joy-handle { top: calc(50% - var(--pos, 0) * 46%); }
+/* Snap back to centre with a spring-like ease only when not being dragged. */
+.joy-track:not(.dragging) .joy-handle { transition: left 0.18s ease, top 0.18s ease; }
+
+.estop {
+  width: 100%;
+  margin-top: 0.9rem;
   border: none;
   border-radius: var(--radius-sm);
-  padding: 1.1rem 0.5rem;
+  padding: 0.85rem 0.5rem;
   font-size: 1rem;
   font-weight: 600;
   font-family: inherit;
   cursor: pointer;
   color: var(--neutral-0);
+  background: var(--status-error);
+  letter-spacing: 1px;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   transition: filter 0.15s ease, transform 0.1s ease;
   user-select: none;
   -webkit-user-select: none;
   touch-action: none;
 }
-.jog.btn-neg, .jog.btn-pos { background: var(--status-ready); }
-.jog:active { filter: brightness(1.1); transform: scale(0.97); }
-.jog:disabled { background: var(--status-off); cursor: not-allowed; box-shadow: none; }
-.estop { flex: 0 0 90px; background: var(--status-error); letter-spacing: 1px; }
+.estop:active { filter: brightness(1.1); transform: scale(0.99); }
 .hint { margin: 0.5rem 0 0; font-size: 0.75rem; color: var(--text-muted); }
 
 /* Parameter rows */

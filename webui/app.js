@@ -7,14 +7,27 @@ const POLL_INTERVAL_MS = 250;
 
 // Parameters with group "pid" go in the PID card; the rest go in the
 // Parameters card. Within that card only these keys stay visible -- everything
-// else is tucked into a collapsed "More parameters" disclosure.
-const ALWAYS_VISIBLE = new Set(["jog_speed"]);
+// else is tucked into a collapsed "More parameters" disclosure. The manual
+// drive is a joystick now, so the (full-scale) joy speed lives in there too and
+// nothing stays pinned open.
+const ALWAYS_VISIBLE = new Set();
 
-// Direction button labels per controller role.
+// End labels for the manual-drive joystick per controller role. The joystick
+// axis follows the physical one: the cart drives horizontally (left/right),
+// the lift vertically (down/up).
 const JOG_LABELS = {
   cart: { "-1": "◀ Left", "1": "Right ▶" },
   lift: { "-1": "Down ▼", "1": "▲ Up" },
 };
+const JOY_AXIS = { cart: "x", lift: "y" };
+
+// Below this fraction of full travel the stick reads as centred (0). Keeps a
+// resting hand from creeping the drive.
+const JOY_DEADZONE = 0.06;
+
+// Minimum gap between velocity posts while dragging (ms). A release (velocity
+// 0) bypasses this and is sent immediately.
+const JOY_SEND_INTERVAL_MS = 80;
 
 const panelsEl = document.getElementById("panels");
 const linkBadge = document.getElementById("link-badge");
@@ -166,6 +179,129 @@ function makeParamRow(name, spec) {
   return { row, input, valEl: val };
 }
 
+// Throttled sender for joystick velocity updates. While dragging, send() is
+// rate-limited to JOY_SEND_INTERVAL_MS but always keeps the latest value
+// queued so the drive ends up at wherever the stick actually is. sendNow()
+// bypasses the throttle -- used for the release (velocity 0) so a stop can
+// never sit behind a queued non-zero update.
+function makeVelocitySender(name) {
+  let timer = null;
+  let pending = null;
+
+  function flush() {
+    timer = null;
+    if (pending === null) return;
+    const v = pending;
+    pending = null;
+    post(name, "jog_velocity", { velocity: v });
+    timer = setTimeout(flush, JOY_SEND_INTERVAL_MS);
+  }
+
+  return {
+    send(v) {
+      pending = v;
+      if (!timer) flush();
+    },
+    sendNow(v) {
+      pending = null;
+      if (timer) { clearTimeout(timer); timer = null; }
+      post(name, "jog_velocity", { velocity: v });
+    },
+  };
+}
+
+// One-axis spring-return joystick that replaces the hold-to-jog buttons.
+// Displacement from centre maps linearly to target velocity (0 at centre,
+// +/- fullScale at the ends); releasing springs the handle back to centre and
+// posts velocity 0. Returns a handle the panel keeps for live updates
+// (fullScale from the joy-speed param, and end-stop gating).
+function makeJoystick(name, role) {
+  const axis = JOY_AXIS[role] || "x";
+  const labels = JOG_LABELS[role] || JOG_LABELS.cart;
+  const sender = makeVelocitySender(name);
+
+  const wrap = document.createElement("div");
+  wrap.className = "joystick";
+  wrap.dataset.axis = axis;
+
+  const endNeg = document.createElement("span");
+  endNeg.className = "joy-end joy-end-neg";
+  endNeg.textContent = labels["-1"];
+  const endPos = document.createElement("span");
+  endPos.className = "joy-end joy-end-pos";
+  endPos.textContent = labels["1"];
+
+  const track = document.createElement("div");
+  track.className = "joy-track";
+  const handle = document.createElement("div");
+  handle.className = "joy-handle";
+  track.appendChild(handle);
+
+  const value = document.createElement("div");
+  value.className = "joy-value";
+
+  wrap.append(endNeg, track, endPos, value);
+
+  const joy = {
+    wrap,
+    fullScale: 0,
+    limits: { pos: false, neg: false },
+    dragging: false,
+  };
+
+  function render(pos) {
+    handle.style.setProperty("--pos", pos);
+    const rpm = Math.round(pos * joy.fullScale);
+    value.textContent = rpm === 0 ? "0 rpm" : `${rpm > 0 ? "+" : ""}${rpm} rpm`;
+    value.classList.toggle("active", rpm !== 0);
+  }
+
+  // Fraction of full travel (clamped to [-1, 1]) for a pointer event, after
+  // deadzone and end-stop gating.
+  function posFromEvent(e) {
+    const r = track.getBoundingClientRect();
+    let p = axis === "y"
+      ? (r.top + r.height / 2 - e.clientY) / (r.height / 2)   // up = +
+      : (e.clientX - (r.left + r.width / 2)) / (r.width / 2);  // right = +
+    p = Math.max(-1, Math.min(1, p));
+    if (p > 0 && joy.limits.pos) p = 0;   // blocked by a triggered end stop
+    if (p < 0 && joy.limits.neg) p = 0;
+    if (Math.abs(p) < JOY_DEADZONE) p = 0;
+    return p;
+  }
+
+  function onMove(e) {
+    if (!joy.dragging) return;
+    e.preventDefault();
+    const p = posFromEvent(e);
+    render(p);
+    sender.send(Math.round(p * joy.fullScale));
+  }
+
+  function onUp(e) {
+    if (!joy.dragging) return;
+    joy.dragging = false;
+    track.classList.remove("dragging");
+    try { track.releasePointerCapture(e.pointerId); } catch (_) { /* not captured */ }
+    render(0);            // spring back to centre
+    sender.sendNow(0);    // and stop immediately
+  }
+
+  track.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    joy.dragging = true;
+    track.classList.add("dragging");
+    try { track.setPointerCapture(e.pointerId); } catch (_) { /* older browsers */ }
+    onMove(e);
+  });
+  track.addEventListener("pointermove", onMove);
+  track.addEventListener("pointerup", onUp);
+  track.addEventListener("pointercancel", onUp);
+
+  render(0);
+  return joy;
+}
+
 function buildPanel(ctrl) {
   const name = ctrl.name;
   const tpl = document.getElementById("panel-template").content.cloneNode(true);
@@ -216,20 +352,12 @@ function buildPanel(ctrl) {
   if (advanced.children.length > 1) paramsBox.appendChild(advanced);
   if (pidBox && pidAdvanced) pidBox.appendChild(pidAdvanced);
 
-  // Jog buttons (hold-to-jog).
-  const labels = JOG_LABELS[ctrl.role] || JOG_LABELS.cart;
-  const jogButtons = {};
-  root.querySelectorAll(".jog").forEach((btn) => {
-    const dir = btn.dataset.dir;
-    jogButtons[dir] = btn;
-    btn.textContent = labels[dir] || (dir === "1" ? "+" : "-");
-    const start = (e) => { e.preventDefault(); post(name, "jog", { direction: Number(dir) }); };
-    const stop = (e) => { e.preventDefault(); post(name, "jog_stop", {}); };
-    btn.addEventListener("pointerdown", start);
-    btn.addEventListener("pointerup", stop);
-    btn.addEventListener("pointerleave", stop);
-    btn.addEventListener("pointercancel", stop);
-  });
+  // Manual drive: a spring-return one-axis joystick (replaces the hold-to-jog
+  // buttons). Its full-scale velocity is the joy-speed param.
+  const joystick = makeJoystick(name, ctrl.role);
+  root.querySelector(".joy-mount").appendChild(joystick.wrap);
+  const jogSpec = params.find((spec) => spec.key === "jog_speed");
+  joystick.fullScale = jogSpec ? Number(jogSpec.default) : 0;
 
   root.querySelector(".estop").addEventListener("click", () => post(name, "stop", {}));
 
@@ -261,7 +389,7 @@ function buildPanel(ctrl) {
     inputs,
     valEls,
     readoutCells,
-    jogButtons,
+    joystick,
     flags: {
       conn: root.querySelector(".flag-conn"),
       drive: root.querySelector(".flag-drive"),
@@ -344,10 +472,13 @@ function updatePanel(name, data) {
   p.flags.posLimit.textContent = state.pos_limit ? "POS ENDSTOP" : "pos endstop";
   p.flags.posLimit.classList.toggle("on-limit", !!state.pos_limit);
 
-  // Block jogging further into a triggered end stop; the opposite
-  // direction stays enabled so the cart can be driven back off it.
-  if (p.jogButtons["1"]) p.jogButtons["1"].disabled = !!state.pos_limit;
-  if (p.jogButtons["-1"]) p.jogButtons["-1"].disabled = !!state.neg_limit;
+  // Block driving further into a triggered end stop; the opposite direction
+  // stays available so the cart can be driven back off it. The joystick reads
+  // these to snap the blocked side to centre while dragging.
+  if (p.joystick) {
+    p.joystick.limits.pos = !!state.pos_limit;
+    p.joystick.limits.neg = !!state.neg_limit;
+  }
 
   // Readout.
   for (const [key, { cell, fmt }] of Object.entries(p.readoutCells)) {
@@ -362,6 +493,12 @@ function updatePanel(name, data) {
       input.value = value;
       if (p.valEls[key]) p.valEls[key].textContent = value;
     }
+  }
+
+  // Keep the joystick's full-scale in step with the joy-speed param (tuned in
+  // "More parameters" or applied by a settings load).
+  if (p.joystick && data.params && data.params.jog_speed != null) {
+    p.joystick.fullScale = Number(data.params.jog_speed);
   }
 
   p.errLine.textContent = data.last_error || "";

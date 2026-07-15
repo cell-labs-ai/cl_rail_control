@@ -46,15 +46,12 @@
       </div>
 
       <div class="panel-body">
-        <!-- Manual drive -->
+        <!-- Manual drive (spring-return joystick built by app.js) -->
         <div class="card drive-card">
           <h3>Manual drive</h3>
-          <div class="jog-row">
-            <button class="jog btn-neg" data-dir="-1"></button>
-            <button class="estop">STOP</button>
-            <button class="jog btn-pos" data-dir="1"></button>
-          </div>
-          <p class="hint">Press and hold to move; release to stop.</p>
+          <div class="joy-mount"></div>
+          <button class="estop">STOP</button>
+          <p class="hint">Push and hold the stick to drive — the further you push, the faster. Release to spring back to zero.</p>
         </div>
 
         <!-- PID tuning -->
