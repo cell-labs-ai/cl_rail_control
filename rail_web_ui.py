@@ -119,6 +119,31 @@ DIGITAL_OUTPUT_BIT_BRAKE = 0
 # Currents". Comparable to the current from 6075h/2031h/203Bh:05h.
 OD_MOTOR_CURRENT_ACTUAL = (0x2039, 0x05, 32)
 
+# Connection watchdog heartbeat. Each controller runs a NanoJ program that
+# maps user object 2400h:01h ("NodeGuard", S32) as input and stops the drive
+# (writes controlword 6040h = 0) when the value stops CHANGING for its TimeOut
+# (100 ms). The program arms itself on the first nonzero value it sees, so a
+# freshly power-cycled drive that is never fed stays unaffected.
+#
+# This side therefore writes an incrementing counter to 2400h:01h from a
+# dedicated thread per controller (see _heartbeat_loop). If this process dies,
+# the Pi crashes or the WiFi/Modbus link drops, the counter freezes and the
+# drive halts itself ~TimeOut later. NB once armed, the watchdog stays armed
+# until the controller is power-cycled -- so after this script has run, other
+# tools (motion_test.py, ...) that don't feed 2400h:01h will have the drive
+# stopping on them until a power cycle.
+#
+# The interval must sit comfortably below the NanoJ TimeOut: 25 ms gives ~4
+# heartbeats per 100 ms window. Over WiFi a single retransmit can eat most of
+# that margin -- if nuisance stops occur, raise TimeOut in the NanoJ program
+# rather than shortening the interval (the bus is shared with the state
+# poller and the 50 Hz PID loop, so more writes just add congestion).
+OD_HEARTBEAT = (0x2400, 0x01, 32)
+HEARTBEAT_INTERVAL_S = 0.1
+# The counter stays in 1..HEARTBEAT_MAX (S32 positive range): 0 is skipped
+# because the NanoJ program treats it as "not armed yet".
+HEARTBEAT_MAX = 0x7FFFFFFF
+
 # Statusword (6041h) state-machine mask/pattern (see decodeStatusword() in
 # app.js for the full state table).
 STATUSWORD_STATE_MASK = 0x6F
@@ -447,6 +472,10 @@ class RailController:
         self._poll_thread = None
         self._pid_thread = None
         self._pid_stop = threading.Event()
+        self._heartbeat_thread = None
+        self._heartbeat_value = 0
+        # None until the first heartbeat write; surfaced in the UI snapshot.
+        self.heartbeat_ok = None
 
         # Simulation state (only used when self._simulate).
         self._sim_velocity = 0.0
@@ -456,6 +485,23 @@ class RailController:
         self._sim_last = time.monotonic()
 
     # -- lifecycle ---------------------------------------------------------
+
+    def start_heartbeat(self):
+        """Start feeding the NanoJ connection watchdog (see OD_HEARTBEAT).
+
+        Called BEFORE anything that walks the drive's state machine -- notably
+        the lift's check_homing(): if a previous run armed the watchdog and the
+        controller was not power-cycled since, the drive is sitting there timed
+        out, writing controlword 0 every NanoJ cycle, and no enable walk can
+        win against that until the heartbeat is beating again."""
+        if self._simulate or not self.connected:
+            return
+        self._stop_event.clear()
+        # Make sure the watchdog program is actually running (2300h bit 0).
+        self._write(OD_NANOJ_CONTROL, 1)
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True)
+        self._heartbeat_thread.start()
 
     def start(self):
         self._stop_event.clear()
@@ -469,10 +515,16 @@ class RailController:
                 self.stop_motor()
             except Exception:
                 pass
+        # The heartbeat keeps beating until AFTER stop_motor(), so the drive
+        # stays responsive for the commanded stop; once it ceases, the drives
+        # also stop themselves ~TimeOut later as a backstop.
         self._stop_event.set()
         if self._poll_thread is not None:
             self._poll_thread.join(timeout=2)
             self._poll_thread = None
+        if self._heartbeat_thread is not None:
+            self._heartbeat_thread.join(timeout=2)
+            self._heartbeat_thread = None
 
     # -- low-level bus access ---------------------------------------------
 
@@ -494,6 +546,49 @@ class RailController:
             self.last_error = f"write {index:#06x}:{sub:02x} failed: {result.getError()}"
             return False
         return True
+
+    # -- connection watchdog heartbeat --------------------------------------
+
+    def _heartbeat_loop(self):
+        """Write an ever-changing counter to 2400h:01h every
+        HEARTBEAT_INTERVAL_S (see the OD_HEARTBEAT block for the contract).
+        The first write arms the watchdog on the drive; from then on ONLY this
+        thread keeps the drive from stopping itself, so it runs for the whole
+        lifetime of the connection and is never paused.
+
+        Paced against a monotonic deadline, not a fixed sleep after each
+        write: the write itself takes a WiFi round trip, and sleeping the full
+        interval on top of that would stretch the effective period toward the
+        drive's timeout. Failures are written straight to the console on state
+        CHANGE only (a dead link would otherwise spam at 40 Hz) and kept out
+        of last_error -- the drive stopping itself is the designed reaction,
+        not an operator-actionable fault."""
+        next_beat = time.monotonic()
+        while not self._stop_event.is_set():
+            self._heartbeat_value = self._heartbeat_value % HEARTBEAT_MAX + 1
+            index, sub, bits = OD_HEARTBEAT
+            with self._lock:
+                result = self._accessor.writeNumber(
+                    self._handle, self._heartbeat_value,
+                    Nanolib.OdIndex(index, sub), bits)
+            ok = not result.hasError()
+            if ok != self.heartbeat_ok:
+                stamp = time.strftime('%H:%M:%S')
+                if ok:
+                    print(f"[{stamp}] {self.name.upper()} heartbeat: OK")
+                else:
+                    print(f"[{stamp}] {self.name.upper()} heartbeat: write "
+                          f"failed ({result.getError()}) -- drive will halt "
+                          f"itself until the connection recovers")
+            self.heartbeat_ok = ok
+            next_beat += HEARTBEAT_INTERVAL_S
+            delay = next_beat - time.monotonic()
+            if delay <= 0:
+                # The write overran the interval (bus congestion): re-anchor
+                # and beat again immediately rather than bursting to catch up.
+                next_beat = time.monotonic()
+                continue
+            self._stop_event.wait(delay)
 
     # -- readout poller ----------------------------------------------------
 
@@ -657,8 +752,10 @@ class RailController:
         if self._simulate:
             self.drive_enabled = True
             return True
-        # Stop any running NanoJ program.
-        self._write(OD_NANOJ_CONTROL, 0)
+        # Keep the NanoJ connection watchdog running (see OD_HEARTBEAT).
+        # This used to STOP the NanoJ program -- that would disarm the
+        # watchdog on every enable.
+        self._write(OD_NANOJ_CONTROL, 1)
         self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
         self._write(OD_MOTION_PROFILE_TYPE, MOTION_PROFILE_JERK_LIMITED)
         self._write(OD_TARGET_VELOCITY, 0)
@@ -769,7 +866,8 @@ class RailController:
         Returns the last statusword; commands no motion (target velocity held
         at 0, controlword bit 4 = 0)."""
         self._write(OD_TARGET_VELOCITY, 0)
-        self._write(OD_NANOJ_CONTROL, 0)
+        # Keep (not stop!) the NanoJ connection watchdog running.
+        self._write(OD_NANOJ_CONTROL, 1)
         return self._walk_to_operation_enabled()
 
     def _read_velocity_rpm(self):
@@ -1451,6 +1549,12 @@ class ControllerManager:
                     print(f"  --> {name.upper()}: serial '{serial}' matches ...{matched}")
                     ctrl = RailController(name, matched, self._accessor, handle,
                                           self._bus_lock, simulate=False, role=role)
+                    # Feed the NanoJ connection watchdog BEFORE anything walks
+                    # the state machine: a drive whose watchdog is already
+                    # armed (previous run, no power cycle since) is spamming
+                    # controlword 0 until the heartbeat resumes, and the
+                    # check_homing() below could never enable against that.
+                    ctrl.start_heartbeat()
                     # Lift only: establish the homing state -- and home on the
                     # spot if it is already parked on the top end stop, the usual
                     # case -- BEFORE the poll thread starts, so check_homing() has
@@ -1640,6 +1744,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "pid_running": ctrl.pid_running,
                 "homing_complete": ctrl.homing_complete,
                 "homing_in_progress": ctrl.homing_in_progress,
+                "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
                 "state": ctrl.get_state(),
                 "params": ctrl.get_params(),
