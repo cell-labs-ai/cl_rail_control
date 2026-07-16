@@ -92,7 +92,14 @@ OD_CONTROL_WORD = (0x6040, 0x00, 16)
 OD_STATUS_WORD = (0x6041, 0x00, 16)
 OD_NANOJ_CONTROL = (0x2300, 0x00, 32)
 OD_MODE_OF_OPERATION = (0x6060, 0x00, 8)
+# Modes of operation display (6061h): the mode the drive is ACTUALLY running,
+# which lags the 6060h command by up to a drive cycle. Poll this after writing
+# 6060h before trusting any mode-dependent object (notably statusword bit 12).
+OD_MODE_OF_OPERATION_DISPLAY = (0x6061, 0x00, 8)
 OD_TARGET_VELOCITY = (0x60FF, 0x00, 32)
+# Velocity actual value (606Ch), signed, in rpm. Read directly (rather than via
+# the mode-dependent statusword speed flag) to tell whether the motor is at rest.
+OD_VELOCITY_ACTUAL = (0x606C, 0x00, 32)
 # Digital Inputs (60FDh): bit 0 = negative limit switch (NLS), bit 1 =
 # positive limit switch (PLS) -- see C5-E manual, chapter 10 "60FDh Digital
 # Inputs" and chapter 7.1.2 "Digital inputs".
@@ -118,31 +125,28 @@ STATUSWORD_STATE_MASK = 0x6F
 STATUSWORD_QUICK_STOP_ACTIVE = 0x07
 STATUSWORD_OPERATION_ENABLED = 0x27
 
-# Quick Stop Option Code (605Ah): what the drive does on a quick stop (e.g. a
-# limit switch). Codes 5/6/7 brake and STAY in 'Quick stop active', so recovery
-# is the direct bit-2 edge (CiA-402 transition 16); codes 0/1/2 brake and drop
-# to 'Switch on disabled', forcing the long shutdown -> switch on -> enable path.
-# 6 = brake on the quick-stop ramp (6085h) and stay in Quick stop active. The
-# lift is synced to the cart's value at connect so both recover from an end stop
-# the same way (cart goes 0x9697 -> 0x96B7 directly; the lift otherwise detours
-# through 0x12C0 'Switch on disabled').
-OD_QUICK_STOP_OPTION_CODE = (0x605A, 0x00, 16)
-QUICK_STOP_OPTION_STAY_ACTIVE = 6
+# Quick Stop Option Code (605Ah) is configured on the controller itself and is
+# NOT written from here. It decides what the drive does on a quick stop (e.g. a
+# limit switch): codes 5/6/7 brake and STAY in 'Quick stop active', so recovery
+# is the direct bit-2 edge (CiA-402 transition 16); codes 0/1/2 brake and drop to
+# 'Switch on disabled', forcing the long shutdown -> switch on -> enable path.
+# Every enable/homing path below handles BOTH, so they work with whatever the
+# drive is configured with -- see _enable_keep_mode() / _ensure_operation_enabled().
 
 # Homing mode (mode of operation 6). After connecting the lift we switch to it
-# once and read statusword bit 12 ("Homing attained") to record whether homing
-# has already been performed -- see C5-E manual p.79. If it has not, we run the
-# homing procedure with homing method 35 (6098h): take the CURRENT position as
-# the home/zero reference -- no motion (see C5-E manual "6098h Homing Method").
+# and read statusword bit 12 ("Homing attained") to see whether homing has
+# already been performed -- see C5-E manual p.79. If it has not, and the lift is
+# already resting on the top end stop, we home on the spot with homing method 35
+# (6098h): take the CURRENT position as the home/zero reference -- no motion
+# (see C5-E manual "6098h Homing Method").
 DRIVE_MODE_HOMING = 6
 STATUSWORD_HOMING_ATTAINED_BIT = 12
 STATUSWORD_HOMING_ERROR_BIT = 13
-# Statusword bit 12 is mode-dependent: in Homing mode it is "Homing attained"
-# (above); in Profile Velocity mode it is the "Speed" flag -- 1 = speed is 0.
-# The lift jogs in Profile Velocity mode, so while it is being driven up into
-# the top end stop this reads back as "motor at standstill". Governed by the
-# velocity-threshold objects 606Fh / 6070h on the drive.
-STATUSWORD_SPEED_ZERO_BIT = 12
+# NB statusword bit 12 is mode-dependent: in Homing mode it is "Homing attained"
+# (above), in Profile Velocity mode it is the "Speed" flag (1 = speed is 0). Only
+# read it once _wait_for_mode() has confirmed which mode the drive is actually
+# running. Standstill is taken from 606Ch instead (see _read_velocity_rpm), which
+# means the same thing in every mode.
 OD_HOMING_METHOD = (0x6098, 0x00, 8)
 HOMING_METHOD_CURRENT_POSITION = 35
 # Controlword to start homing: Enable operation (0x0F) with bit 4 ("Homing
@@ -152,10 +156,26 @@ CONTROLWORD_START_HOMING = 0x1F
 # (bit 13). Method 35 is effectively instantaneous, but the poll stays generic.
 HOMING_TIMEOUT_S = 10.0
 HOMING_POLL_S = 0.05
+# Bounded wait for a 6060h mode change to take effect (6061h reads back the
+# requested mode). Needed because statusword bit 12 is mode-dependent -- reading
+# it before Homing mode is actually active reads the old mode's meaning (in
+# Profile Velocity that is the speed-0 flag, which is 1 at standstill and would
+# masquerade as "Homing attained").
+#
+# NB the drive does NOT take a 6060h mode change while in 'Quick stop active'
+# (seen on the rig: the lift starting on its end stop never entered Homing
+# mode). Recover to 'Operation enabled' first, then switch modes -- see
+# check_homing() / _run_endstop_homing().
+MODE_SWITCH_TIMEOUT_S = 1.0
+MODE_SWITCH_POLL_S = 0.02
 # Minimum gap between auto-homing attempts, so a homing that keeps failing (bad
 # drive config, etc.) retries at a slow, non-hammering cadence rather than every
 # poll cycle while the lift sits on the top end stop.
 HOMING_RETRY_INTERVAL_S = 5.0
+# |606Ch| at or below this (rpm) counts as standstill when deciding whether the
+# lift is resting on the top end stop. Not 0: a closed-loop drive holding against
+# the stop jitters by a few rpm.
+VELOCITY_ZERO_RPM = 5
 
 # Lift only: soft lower travel limit, as a Position actual value (6064h) count
 # relative to the home reference set at the top end stop when homing. Downward
@@ -174,11 +194,16 @@ HOMING_RETRY_INTERVAL_S = 5.0
 # None disables the limit.
 LIFT_DOWN_POSITION_LIMIT = None
 
-# _ensure_operation_enabled() polls the statusword until the CiA-402 state
-# machine has worked through its enable transitions (each takes a controller
-# cycle), so it doesn't race ahead of the drive. Bounded by the timeout so a
-# stuck drive can't hang the request thread.
-ENABLE_TIMEOUT_S = 1.0
+# _walk_to_operation_enabled() steps the CiA-402 state machine one confirmed
+# transition at a time. The timeout must cover the lift's automatic brake
+# sequences, which gate those transitions (manual 7.3.3 / 2038h, all four times
+# default 1000 ms): a still-running brake CLOSE from a preceding stop
+# (2038h:1h + :2h) makes the drive refuse the power-up transition until it
+# finishes, and Operation enabled is only reported after the brake OPEN
+# sequence (2038h:3h + :4h). Worst case close + open is ~4 s at defaults; the
+# cart (no brake) lands in a few cycles and never comes near this. Bounded so
+# a stuck drive can't hang the request thread.
+ENABLE_TIMEOUT_S = 5.0
 ENABLE_POLL_S = 0.01
 
 OD_PROFILE_ACCELERATION = (0x6083, 0x00, 32)
@@ -516,24 +541,21 @@ class RailController:
         the top end stop and, when it is, kick off the end-stop homing procedure
         (method 35) in the background.
 
-        "Resting on the top end stop" = the motor has stopped (statusword bit 12
-        = speed 0, valid because we keep Profile Velocity selected outside
-        homing) AND the drive is at the positive limit -- either the limit switch
-        forced Quick stop active, or the positive-limit input (60FDh, the same
-        signal the jog code gates on) reads set. Covering both makes it robust to
-        how the end stop leaves the drive and lets a restart-on-the-end-stop
-        still home. homing_in_progress guards re-entry; the retry interval keeps
-        a persistently failing home from firing every poll cycle."""
+        This covers the lift that was NOT on the end stop when the script
+        started: check_homing() left it unhomed and UP-only, and the operator has
+        now driven it up into the stop. A lift already parked on the stop at
+        startup is homed by check_homing() itself and never reaches here.
+
+        See _resting_on_endstop() for what counts as resting on the stop.
+        homing_in_progress guards re-entry; the retry interval keeps a
+        persistently failing home from firing every poll cycle."""
         if self.role != "lift" or self._simulate:
             return
         if self.homing_complete or self.homing_in_progress:
             return
-        status_word = snapshot.get("status_word")
-        if status_word is None:
-            return
-        stopped = bool(status_word & (1 << STATUSWORD_SPEED_ZERO_BIT))
-        at_top = _quick_stop_active(status_word) or bool(snapshot.get("pos_limit"))
-        if not (stopped and at_top):
+        if not self._resting_on_endstop(snapshot.get("status_word"),
+                                        snapshot.get("velocity_actual"),
+                                        snapshot.get("pos_limit")):
             return
         now = time.monotonic()
         if now - self._last_homing_attempt < HOMING_RETRY_INTERVAL_S:
@@ -627,9 +649,11 @@ class RailController:
         return True
 
     def enable_drive(self):
-        """Select Profile Velocity mode with a jerk-limited ramp and switch the
-        CiA 402 state machine to 'operation enabled'. The accel/jerk ramp is
-        applied by the caller (jog / PID), since each has its own values."""
+        """Select Profile Velocity mode with a jerk-limited ramp and walk the
+        CiA 402 state machine to 'Operation enabled' (one confirmed transition
+        at a time -- see _walk_to_operation_enabled). The accel/jerk ramp is
+        applied by the caller (jog / PID), since each has its own values.
+        Sets last_error (with the stuck state) on failure."""
         if self._simulate:
             self.drive_enabled = True
             return True
@@ -638,149 +662,126 @@ class RailController:
         self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
         self._write(OD_MOTION_PROFILE_TYPE, MOTION_PROFILE_JERK_LIMITED)
         self._write(OD_TARGET_VELOCITY, 0)
-        # State machine: shutdown -> switch on -> operation enabled.
-        for command in (0x06, 0x07, 0x0F):
-            if not self._write(OD_CONTROL_WORD, command):
+        status_word = self._walk_to_operation_enabled()
+        self.drive_enabled = _operation_enabled(status_word)
+        if not self.drive_enabled:
+            self.last_error = ("drive did not reach Operation enabled "
+                               f"(stuck in {_decode_cia402_state(status_word)})")
+            return False
+        # Confirm Profile Velocity is actually running (6061h). The 6060h write
+        # above is refused if the drive was still in 'Quick stop active' at that
+        # moment (mode changes don't take there); now that the walk has it
+        # enabled, re-select and wait if the display disagrees.
+        if self._read(OD_MODE_OF_OPERATION_DISPLAY) != DRIVE_MODE_PROFILE_VELOCITY:
+            self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
+            if not self._wait_for_mode(DRIVE_MODE_PROFILE_VELOCITY):
+                self.drive_enabled = False
+                self.last_error = "drive did not enter Profile Velocity mode"
                 return False
-        self.drive_enabled = True
         return True
 
-    def _recover_from_endstop(self):
-        """Return the drive from 'Quick stop active' (forced by a triggered
-        limit switch) to 'Operation enabled' without commanding motion, per
-        the C5-E manual chapter 5.4. Returns the last statusword read.
+    def _walk_to_operation_enabled(self):
+        """Walk the CiA-402 state machine to 'Operation enabled' one CONFIRMED
+        transition at a time: read the statusword, issue exactly the controlword
+        the observed state calls for, and repeat until the drive reports
+        Operation enabled or ENABLE_TIMEOUT_S runs out. Returns the last
+        statusword read. Commands no motion: target velocity is held at 0 by the
+        callers and controlword bit 4 stays low.
 
-        Recovery is a 0 -> 1 edge on controlword bit 2 (quick stop): a
-        triggered limit switch leaves this bit untouched (it's still high from
-        normal operation), so force it low (0x02) then request Enable Operation
-        (0x0F), whose bit 2 rises -- CiA-402 transition 16. Bit 4 stays 0 and
-        target velocity is held at 0, so nothing moves.
+        Pacing by the OBSERVED state (not firing 0x06 -> 0x07 -> 0x0F blind) is
+        what makes this coexist with the drive's automatic brake control, whose
+        timed sequences gate the transitions (manual 7.3.3 / 2038h):
 
-        The edge is re-issued until the drive actually reports Operation
-        enabled (bounded by ENABLE_TIMEOUT_S), because the drive finishes its
-        quick-stop deceleration ramp before accepting the transition: a single
-        edge issued while the cart is still braking is consumed without a state
-        change, and once it coasts to standstill bit 2 is already high again,
-        so there is no fresh edge -- it stays stuck in Quick stop active. That
-        is what made the first jog after an endstop fail; re-issuing the edge
-        lands the transition on the first cycle after standstill.
+          * after a stop, the drive spends 2038h:1h + :2h finishing its
+            brake-close sequence, during which it refuses the next power-up
+            transition. A blind sequence is swallowed there -- the drive sticks
+            below Operation enabled with the brake closed and the motor current
+            already on. Here the pending command is simply re-issued each cycle
+            until the drive takes it (same lesson as the old end-stop recovery:
+            commands sent while the drive is busy are consumed without effect).
+          * the final Switched on -> Operation enabled step is the ONE
+            transition that runs the brake-release sequence, and Operation
+            enabled is only reported after it completes (2038h:3h + :4h) -- so
+            the brake is provably open as soon as this returns enabled.
 
-        Assumes 605Ah (Quick Stop Option Code) is already configured on the
-        drive to keep the motor energized in Quick stop active, so forcing
-        bit 2 low doesn't switch it off.
-        """
-        if self._simulate:
-            self.drive_enabled = True
-            return STATUSWORD_OPERATION_ENABLED
+        'Quick stop active' (a triggered end stop) is recovered per role:
 
-        self._write(OD_TARGET_VELOCITY, 0)
+          * cart (no brake): controlword bit-2 edge -- force the quick-stop bit
+            low (0x02), then Enable Operation (0x0F) whose rising bit 2 is
+            CiA-402 transition 16. Fastest way back, keeps the drive energized
+            and in control of the axis while it is still decelerating.
+          * lift: NEVER transition 16 -- it re-enters Operation enabled without
+            the brake-release sequence, so the drive torques against the closed
+            brake (the brake closed on the way INTO Quick stop active). Instead
+            Disable voltage (0x00, transition 12) down to 'Switch on disabled'
+            and walk back up, so the last step is the brake-releasing
+            transition. The load hangs on the closed brake throughout.
 
-        deadline = time.monotonic() + ENABLE_TIMEOUT_S
-        while True:
-            self._write(OD_CONTROL_WORD, 0x02)   # force quick-stop bit low
-            self._write(OD_CONTROL_WORD, 0x0F)   # rising edge -> operation enabled
-            status_word = self._read(OD_STATUS_WORD)
-            if _operation_enabled(status_word) or time.monotonic() >= deadline:
-                return status_word
-            time.sleep(ENABLE_POLL_S)
-
-    def _wait_for_operation_enabled(self):
-        """Poll statusword (6041h) until the drive reports 'Operation enabled',
-        giving the CiA-402 state machine time to work through its shutdown ->
-        switch on -> enable operation transitions (each takes a controller
-        cycle). Returns the last statusword read; gives up after
-        ENABLE_TIMEOUT_S so a stuck read can't hang the request thread."""
+        Fault / Fault reaction active are deliberately NOT recovered here: a
+        fault reset (controlword bit 7) on a loaded axis must be an explicit
+        operator action, not a jog side effect. The walk times out and the
+        caller reports the state."""
         deadline = time.monotonic() + ENABLE_TIMEOUT_S
         while True:
             status_word = self._read(OD_STATUS_WORD)
             if _operation_enabled(status_word) or time.monotonic() >= deadline:
                 return status_word
+            if status_word is not None:
+                state = status_word & STATUSWORD_STATE_MASK
+                if _quick_stop_active(status_word):
+                    if self.role == "lift":
+                        self._write(OD_CONTROL_WORD, 0x00)   # -> Switch on disabled
+                    else:
+                        self._write(OD_CONTROL_WORD, 0x02)   # quick-stop bit low
+                        self._write(OD_CONTROL_WORD, 0x0F)   # rising edge: transition 16
+                elif (status_word & 0x4F) == 0x40:           # Switch on disabled
+                    self._write(OD_CONTROL_WORD, 0x06)       # Shutdown
+                elif state == 0x21:                          # Ready to switch on
+                    self._write(OD_CONTROL_WORD, 0x07)       # Switch on
+                elif state == 0x23:                          # Switched on
+                    self._write(OD_CONTROL_WORD, 0x0F)       # Enable operation
+                # Fault / Not ready to switch on: nothing to send, wait it out.
             time.sleep(ENABLE_POLL_S)
 
     def _ensure_operation_enabled(self):
         """Make sure the drive is in 'Operation enabled' before jogging or
-        starting the PID loop. Recovers from a limit-switch-triggered 'Quick
-        stop active' via _recover_from_endstop(), then -- if that did not land,
-        or the drive was in some other non-enabled state -- runs the full
-        enable_drive() sequence and waits for it to land. Both paths wait for
-        the state machine to actually reach Operation enabled rather than
-        racing a single read ahead of the drive (that race is why jog used to
-        need two clicks). Uses fresh statusword reads, never the poller's
-        up-to-STATE_POLL_INTERVAL_S-old snapshot."""
+        starting the PID loop: enable_drive() selects Profile Velocity and walks
+        the state machine there from wherever it currently is, including
+        end-stop recovery from 'Quick stop active' (see
+        _walk_to_operation_enabled). Waits for the state to actually land
+        rather than racing a single read ahead of the drive (that race is why
+        jog used to need two clicks); uses fresh statusword reads, never the
+        poller's up-to-STATE_POLL_INTERVAL_S-old snapshot."""
         if self._simulate:
             self.drive_enabled = True
             return True
-
-        status_word = self._read(OD_STATUS_WORD)
-
-        if _quick_stop_active(status_word):
-            status_word = self._recover_from_endstop()
-        # Fall through to the full enable sequence if we are still not enabled --
-        # either the drive was never in Quick stop active, or the bit-2 recovery
-        # above did not land because the end stop dropped the drive to 'Switch on
-        # disabled' (605Ah option code 2) rather than holding 'Quick stop active'
-        # (from there only the full sequence re-enables). This mirrors the robust
-        # re-enable the homing path uses, so the cart and lift recover from an
-        # end stop the same way regardless of each drive's quick-stop config.
-        if not _operation_enabled(status_word):
-            if not self.enable_drive():
-                return False
-            status_word = self._wait_for_operation_enabled()
-
-        if not _operation_enabled(status_word):
-            self.last_error = "drive did not reach Operation enabled"
-            self.drive_enabled = False
-            return False
-
+        if not self.enable_drive():
+            return False        # last_error carries the stuck state
         self.last_error = None
-        self.drive_enabled = True
         return True
 
     def _enable_keep_mode(self):
         """Bring the drive to 'Operation enabled' WITHOUT changing the selected
-        mode of operation -- the mode-preserving sibling of
-        _ensure_operation_enabled(), used by homing (which must stay in Homing
-        mode; enable_drive() would force Profile Velocity).
-
-        It takes the SAME branch _ensure_operation_enabled() does, which is how
-        the rest of the code recovers from an end stop:
-
-          * 'Quick stop active' (the limit switch forced it there and 605Ah kept
-            it energized) -> _recover_from_endstop()'s controlword bit-2 edge
-            (CiA-402 transition 16);
-          * otherwise -> walk shutdown -> switch on -> enable operation
-            (0x06 -> 0x07 -> 0x0F), but WITHOUT the mode write.
-
-        The second branch is what the plain _recover_from_endstop() lacked: some
-        end stops (605Ah option code 2) ramp the drive down and drop it to
-        'Switch on disabled' instead of holding 'Quick stop active', and from
-        there only the full sequence re-enables it. Returns the last statusword;
-        commands no motion (target velocity held at 0, controlword bit 4 = 0)."""
+        mode of operation -- the mode-preserving sibling of enable_drive(), used
+        by homing (which must stay in Homing mode; enable_drive() would force
+        Profile Velocity). Same confirmed-transition walk, same per-role
+        end-stop recovery (see _walk_to_operation_enabled), no mode write.
+        Returns the last statusword; commands no motion (target velocity held
+        at 0, controlword bit 4 = 0)."""
         self._write(OD_TARGET_VELOCITY, 0)
-        status_word = self._read(OD_STATUS_WORD)
-        if _quick_stop_active(status_word):
-            return self._recover_from_endstop()
-        if _operation_enabled(status_word):
-            return status_word
-        # Switch on disabled / ready / switched on: walk the state machine, but
-        # do NOT select a mode of operation, so Homing mode stays put.
         self._write(OD_NANOJ_CONTROL, 0)
-        for command in (0x06, 0x07, 0x0F):
-            self._write(OD_CONTROL_WORD, command)
-        return self._wait_for_operation_enabled()
+        return self._walk_to_operation_enabled()
 
-    def get_quick_stop_option_code(self):
-        """Read 605Ah (Quick Stop Option Code); None on error or in simulate."""
-        if self._simulate:
-            return None
-        raw = self._read(OD_QUICK_STOP_OPTION_CODE)
-        return None if raw is None else _to_signed(raw & 0xFFFF, 16)
+    def _read_velocity_rpm(self):
+        """Velocity actual value (606Ch) in rpm, signed; None on read error."""
+        raw = self._read(OD_VELOCITY_ACTUAL)
+        return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
 
-    def set_quick_stop_option_code(self, value):
-        """Write 605Ah (Quick Stop Option Code). No-op (True) in simulate."""
-        if self._simulate:
-            return True
-        return self._write(OD_QUICK_STOP_OPTION_CODE, int(value))
+    def _read_pos_limit(self):
+        """Positive limit switch (60FDh bit 1) read straight off the bus, for
+        when there is no poller snapshot to consult yet; None on read error."""
+        raw = self._read(OD_DIGITAL_INPUTS)
+        return None if raw is None else bool(raw & (1 << DIGITAL_INPUT_BIT_POS_LIMIT))
 
     def set_target_velocity(self, rpm):
         if self._simulate:
@@ -789,14 +790,39 @@ class RailController:
         return self._write(OD_TARGET_VELOCITY, int(rpm))
 
     def stop_motor(self):
-        """Command zero velocity and drop back to 'switched on' (controlword 0x06)."""
+        """Command zero velocity and drop back to 'Switched on' (controlword
+        0x07, Disable operation -- CiA-402 transition 5).
+
+        0x07, not 0x06: leaving Operation enabled triggers the automatic brake
+        close sequence either way, but 0x06 (Shutdown) falls through to 'Ready
+        to switch on', one state further down. Stopping at 'Switched on' keeps
+        the power stage up and makes the next enable a SINGLE transition -- the
+        one the automatic brake control releases the brake on (manual 7.3.3) --
+        instead of a multi-step walk interleaving with the still-running brake
+        close sequence."""
         self.jog_direction = 0
         if self._simulate:
             self._sim_target_velocity = 0.0
             self.drive_enabled = False
             return True
         self._write(OD_TARGET_VELOCITY, 0)
-        ok = self._write(OD_CONTROL_WORD, 0x06)
+        ok = self._write(OD_CONTROL_WORD, 0x07)
+        # Confirm the state actually LEFT Operation enabled before returning.
+        # The drive first ramps the motor to standstill and runs the brake
+        # close sequence; it reports 'Switched on' only after. Returning early
+        # would let an immediately following jog read the stale 'Operation
+        # enabled', skip its enable walk and write a target velocity that the
+        # still-running disable then discards -- a jog press that does nothing.
+        deadline = time.monotonic() + ENABLE_TIMEOUT_S
+        while ok:
+            status_word = self._read(OD_STATUS_WORD)
+            if status_word is None or not _operation_enabled(status_word):
+                break
+            if time.monotonic() >= deadline:
+                self.last_error = ("stop commanded but drive still reports "
+                                   "Operation enabled")
+                break
+            time.sleep(ENABLE_POLL_S)
         self.drive_enabled = False
         return ok
 
@@ -841,7 +867,7 @@ class RailController:
         direction always stays available so the cart can be driven back off
         the switch. Commanding that opposite direction also recovers the
         drive out of the 'Quick stop active' state the limit switch forced
-        it into (see _recover_from_endstop()), so normal operation resumes
+        it into (see _walk_to_operation_enabled), so normal operation resumes
         as soon as it's commanded.
         """
         direction = max(-1, min(1, int(direction)))
@@ -944,88 +970,212 @@ class RailController:
     # give the payload winch its own up/down semantics. For now they are the
     # generic jog; fill in the real behaviour later.
 
-    def check_homing(self):
-        """Lift only: select Homing mode (mode of operation 6) and read
-        statusword bit 12 ("Homing attained", C5-E manual p.79) to record
-        whether homing has already been performed. The result is stored on
-        self.homing_complete and surfaced to the UI ("homing complete").
+    def _wait_for_mode(self, mode):
+        """Poll Modes of operation display (6061h) until it reports the drive is
+        actually running the given mode of operation, or MODE_SWITCH_TIMEOUT_S
+        elapses. Returns True once the mode is active, False on timeout/read
+        error. Callers must have written 6060h first; this closes the gap before
+        reading any mode-dependent object (e.g. statusword bit 12)."""
+        deadline = time.monotonic() + MODE_SWITCH_TIMEOUT_S
+        while time.monotonic() < deadline:
+            if self._read(OD_MODE_OF_OPERATION_DISPLAY) == mode:
+                return True
+            time.sleep(MODE_SWITCH_POLL_S)
+        return False
 
-        Called once right after connecting, before normal operation. It only
-        reads (operation is not enabled, no motion is commanded). It then
-        restores Profile Velocity mode, so outside the homing procedure the
-        drive is always in velocity mode -- keeping statusword bit 12 meaningful
-        as the speed-0 flag (used to spot the lift resting on the end stop) and
-        never leaving it stranded in Homing mode. Returns True if the statusword
-        was read, False otherwise (homing_complete left None)."""
+    def _resting_on_endstop(self, status_word, velocity, pos_limit):
+        """Lift only: True if the lift is standing still against the top end
+        stop, so the position it is at right now IS the home reference and
+        homing method 35 can just take it.
+
+        'Standing still' is |606Ch| <= VELOCITY_ZERO_RPM. It is read from 606Ch
+        rather than the statusword speed flag because that flag lives on bit 12,
+        which in Homing mode means "Homing attained" instead -- and this check
+        has to be usable while Homing mode is already selected.
+
+        'At the top end stop' is Quick stop active OR the positive-limit input
+        (60FDh bit 1). Both are checked because which one you get depends on the
+        drive's Quick Stop Option Code (605Ah), which is configured on the
+        controller and not known here.
+        """
+        if velocity is None or abs(velocity) > VELOCITY_ZERO_RPM:
+            return False
+        return _quick_stop_active(status_word) or bool(pos_limit)
+
+    def _enter_homing_mode(self):
+        """Select Homing mode (6060h = 6) and wait for 6061h to confirm the drive
+        is actually running it. Required before reading any mode-dependent object
+        (statusword bit 12) or issuing the homing start edge. True once active."""
+        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
+        return self._wait_for_mode(DRIVE_MODE_HOMING)
+
+    def _leave_homing_mode(self, keep_enabled):
+        """Reselect Profile Velocity on the way out of Homing mode. Run on EVERY
+        exit, success or failure, so the drive is never stranded in Homing mode --
+        that would leave statusword bit 12 reading as "Homing attained" instead of
+        the speed flag, and the next jog fighting the wrong mode.
+
+        keep_enabled: True after a homing run -- hold zero velocity and put the
+        controlword back to 0x0F, which both keeps the drive in Operation enabled
+        and clears the homing start bit so the next run gets a real rising edge.
+        False after a read-only check -- leave the state machine as it was found,
+        commanding nothing.
+        """
+        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
+        # Confirm via 6061h like every other mode change: a jog issued right
+        # after homing must not write its target velocity while the drive is
+        # still running Homing mode (where 60FFh is ignored).
+        self._wait_for_mode(DRIVE_MODE_PROFILE_VELOCITY)
+        if keep_enabled:
+            self._write(OD_TARGET_VELOCITY, 0)
+            self._write(OD_CONTROL_WORD, 0x0F)
+            self.drive_enabled = _operation_enabled(self._read(OD_STATUS_WORD))
+            self.jog_direction = 0
+
+    def _home_on_current_position(self):
+        """Lift only: run homing method 35 -- take the current position as the
+        home/zero reference, no motion (C5-E manual "6098h Homing Method").
+
+        Assumes the caller already brought the drive to 'Operation enabled' and
+        THEN selected + confirmed Homing mode (enable first -- see the note in
+        check_homing), and that the lift is resting on the top end stop. Sets
+        homing_complete / last_error; returns True once homing attained.
+        """
+        if not self._write(OD_HOMING_METHOD, HOMING_METHOD_CURRENT_POSITION):
+            self.homing_complete = False
+            self.last_error = "homing: could not set homing method 35"
+            return False
+
+        # Safety net: the caller enabled before the mode switch, so this is
+        # normally a single confirming statusword read. If the state dropped in
+        # between it re-runs the recovery, still without touching the mode.
+        status_word = self._enable_keep_mode()
+        if not _operation_enabled(status_word):
+            self.homing_complete = False
+            self.last_error = "homing: could not re-enable drive at end stop"
+            return False
+
+        # Rising edge on controlword bit 4 starts the homing operation. Write
+        # 0x0F first to guarantee bit 4 is LOW before raising it -- if a
+        # previous homing run was aborted with the start bit left high (e.g.
+        # the process was killed mid-homing), 0x1F alone has no edge and the
+        # procedure would never start.
+        self._write(OD_CONTROL_WORD, 0x0F)
+        if not self._write(OD_CONTROL_WORD, CONTROLWORD_START_HOMING):
+            self.homing_complete = False
+            self.last_error = self.last_error or "homing: failed to start"
+            return False
+
+        ok, _msg = self._wait_for_homing()   # sets homing_complete + last_error
+        return ok
+
+    def check_homing(self):
+        """Lift only: establish the homing state at connect and, if the lift is
+        already parked on the top end stop, home it there and then -- the normal
+        way this rig starts up, since it is left hanging on its top end stop.
+
+        ORDER MATTERS: a lift parked on the end stop is sitting in 'Quick stop
+        active', and the drive does not take a 6060h mode change in that state --
+        6061h keeps reporting the old mode and the switch to Homing mode times
+        out. So when the lift is resting on the stop, the drive is brought to
+        'Operation enabled' FIRST (pure state-machine recovery: target velocity
+        held at 0, no motion -- see _enable_keep_mode), and only then is Homing
+        mode selected. With the mode active, statusword bit 12 ("Homing
+        attained", C5-E manual p.79) decides:
+
+          * bit 12 set -> already homed, nothing to do;
+          * bit 12 clear and resting on the top end stop -> home on the current
+            position with method 35, right here, still in Homing mode;
+          * bit 12 clear and NOT on the end stop -> stay unhomed. The lift is
+            locked UP-only (see _down_locked) and the poll loop homes it as soon
+            as the operator drives it up into the stop (_maybe_home_at_endstop).
+
+        Called from connect() BEFORE the poll thread starts, so it has the bus to
+        itself and the lift is ready by the time the UI comes up. Always restores
+        Profile Velocity on the way out. Returns True if the homing state was
+        established, False if it could not be read (homing_complete left None).
+        """
         if self._simulate:
             self.homing_complete = True
             return True
-        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
-        status_word = self._read(OD_STATUS_WORD)
-        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
-        if status_word is None:
-            self.homing_complete = None
-            return False
-        self.homing_complete = bool(status_word & (1 << STATUSWORD_HOMING_ATTAINED_BIT))
-        return True
+
+        self.homing_in_progress = True
+        enabled_here = False
+        try:
+            # Resting on the end stop? Decided from 606Ch / 60FDh / the state
+            # machine, all readable in any mode -- deliberately BEFORE the mode
+            # switch, because it determines whether we must enable first.
+            resting = self._resting_on_endstop(self._read(OD_STATUS_WORD),
+                                               self._read_velocity_rpm(),
+                                               self._read_pos_limit())
+            if resting:
+                # Recover to Operation enabled while still in Profile Velocity;
+                # in Quick stop active the mode change below would not be taken.
+                if not _operation_enabled(self._enable_keep_mode()):
+                    self.homing_complete = None
+                    self.last_error = "homing check: could not enable drive at end stop"
+                    return False
+                enabled_here = True
+
+            if not self._enter_homing_mode():
+                self.homing_complete = None
+                self.last_error = "homing check: drive did not enter Homing mode"
+                return False
+
+            status_word = self._read(OD_STATUS_WORD)
+            if status_word is None:
+                self.homing_complete = None
+                self.last_error = "homing check: could not read statusword"
+                return False
+
+            if status_word & (1 << STATUSWORD_HOMING_ATTAINED_BIT):
+                self.homing_complete = True
+                return True
+
+            self.homing_complete = False
+            if not resting:
+                return True     # not homed, not at the stop: drive up to home it
+            self._home_on_current_position()
+            return True
+        finally:
+            self._leave_homing_mode(keep_enabled=enabled_here)
+            self.homing_in_progress = False
 
     def _run_endstop_homing(self):
-        """Lift only: home against the top end stop with homing method 35 (take
-        the current position as the home reference -- no motion; see C5-E manual
-        "6098h Homing Method").
+        """Lift only: home against the top end stop with homing method 35.
 
-        Entered on a background thread by _maybe_home_at_endstop() once the lift,
-        driven up while unhomed, has come to rest against the upper end stop (the
-        limit switch forced Quick stop active and the motor has stopped). It:
-
-          1. selects Homing mode (6060h = 6) and writes homing method 35;
-          2. recovers out of Quick stop active back to Operation enabled
-             (_recover_from_endstop) and KEEPS the drive enabled throughout;
-          3. starts homing with a rising edge on controlword bit 4 (0x1F) and
-             waits for bit 12 "Homing attained" / bit 13 "Homing error"; then
-          4. on success, hands the drive back to normal operation -- reselects
-             Profile Velocity, target velocity 0, still in Operation enabled --
-             and _wait_for_homing() sets homing_complete = True, which lifts the
-             down-motion lock. On failure the lock stays in place.
-
-        homing_in_progress guards re-entry; it is always cleared on exit."""
+        The same homing check_homing() does at connect, but entered on a
+        background thread by _maybe_home_at_endstop() when the lift was NOT on
+        the end stop at startup and the operator has now driven it up into one.
+        Sets homing_complete = True on success, which lifts the down-motion lock;
+        on failure the lock stays in place and the next poll retries after
+        HOMING_RETRY_INTERVAL_S. homing_in_progress guards re-entry and is always
+        cleared on exit."""
         try:
             if self._simulate:
                 self.homing_complete = True
                 return
 
-            self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
-            self._write(OD_HOMING_METHOD, HOMING_METHOD_CURRENT_POSITION)
-
-            # Re-enable at the end stop, keeping Homing mode. _enable_keep_mode()
-            # handles BOTH ways the end stop can leave the drive -- still in
-            # Quick stop active, or dropped to Switch on disabled -- which is why
-            # the plain bit-2 edge alone previously failed here.
-            status_word = self._enable_keep_mode()
-            if not _operation_enabled(status_word):
+            # Enable FIRST: the lift is sitting on the end stop, typically in
+            # 'Quick stop active', where the drive does not take a 6060h mode
+            # change (see check_homing). No motion: target velocity is held at 0.
+            if not _operation_enabled(self._enable_keep_mode()):
                 self.homing_complete = False
                 self.last_error = "homing: could not re-enable drive at end stop"
                 return
 
-            # Rising edge on controlword bit 4 starts the homing operation.
-            if not self._write(OD_CONTROL_WORD, CONTROLWORD_START_HOMING):
+            # Only now select Homing mode, and confirm it is active before
+            # relying on the homing-specific statusword bits (bit 12 "attained"
+            # / bit 13 "error").
+            if not self._enter_homing_mode():
                 self.homing_complete = False
-                self.last_error = self.last_error or "homing: failed to start"
+                self.last_error = "homing: drive did not enter Homing mode"
                 return
 
-            self._wait_for_homing()   # sets homing_complete + last_error
+            self._home_on_current_position()
         finally:
-            # Always hand the drive back in Profile Velocity, holding zero
-            # velocity -- even on failure, so it is never stranded in Homing mode
-            # (which would break the speed-0 detection and the next jog). On a
-            # successful home this leaves the lift enabled at standstill with the
-            # down lock lifted; the down lock stays on if homing did not attain.
             if not self._simulate:
-                self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
-                self._write(OD_TARGET_VELOCITY, 0)
-                self._write(OD_CONTROL_WORD, 0x0F)
-                self.drive_enabled = _operation_enabled(self._read(OD_STATUS_WORD))
-                self.jog_direction = 0
+                self._leave_homing_mode(keep_enabled=True)
             self.homing_in_progress = False
 
     def _wait_for_homing(self):
@@ -1238,13 +1388,12 @@ class ControllerManager:
             for name, suffix, role in self.TARGETS:
                 ctrl = RailController(name, suffix, None, None, self._bus_lock,
                                       simulate=True, role=role)
-                ctrl.start()
-                # Lift only: check homing (statusword bit 12) once at connect.
-                # If not homed, the lift stays UP-only until it is homed against
-                # the top end stop (the poll loop watches for that); it is not
-                # homed here. (In simulate, check_homing reports it homed.)
+                # Lift only: establish the homing state before the poll thread
+                # starts, as on real hardware. (In simulate, check_homing just
+                # reports it homed.)
                 if role == "lift":
                     ctrl.check_homing()
+                ctrl.start()
                 self.controllers[name] = ctrl
             return
 
@@ -1302,15 +1451,17 @@ class ControllerManager:
                     print(f"  --> {name.upper()}: serial '{serial}' matches ...{matched}")
                     ctrl = RailController(name, matched, self._accessor, handle,
                                           self._bus_lock, simulate=False, role=role)
-                    ctrl.start()
-                    # Lift only: switch to Homing mode (mode of operation 6) and
-                    # read statusword bit 12 once. If not homed, the lift is held
-                    # UP-only until the operator drives it up into the top end
-                    # stop, where the poll loop auto-homes it (method 35).
+                    # Lift only: establish the homing state -- and home on the
+                    # spot if it is already parked on the top end stop, the usual
+                    # case -- BEFORE the poll thread starts, so check_homing() has
+                    # the bus to itself and nothing races its mode switch. If it
+                    # is not on the stop it stays unhomed and UP-only until the
+                    # operator drives it up there (_maybe_home_at_endstop).
                     if role == "lift":
                         ctrl.check_homing()
                         print(f"  --> {name.upper()}: homing "
-                              f"{'complete' if ctrl.homing_complete else 'NOT performed -- drive up to home (down disabled)'}")
+                              f"{'complete' if ctrl.homing_complete else 'NOT performed -- drive up into the top end stop to home (down disabled)'}")
+                    ctrl.start()
                     self.controllers[name] = ctrl
                     found[matched] = handle
                 else:
@@ -1325,27 +1476,9 @@ class ControllerManager:
             if len(found) == len(wanted):
                 break
 
-        # Make the lift recover from an end stop the same way the cart does.
-        self._sync_lift_quick_stop_to_cart()
-
         for name, suffix, _role in self.TARGETS:
             if name not in self.controllers:
                 print(f"WARNING: {name} controller (serial ...{suffix}) not found.")
-
-    def _sync_lift_quick_stop_to_cart(self):
-        """Give the lift the cart's Quick Stop Option Code (605Ah) so both
-        recover from an end stop identically: staying in 'Quick stop active' for
-        the direct bit-2 recovery (CiA-402 transition 16) rather than dropping to
-        'Switch on disabled' and taking the long way back. Falls back to
-        QUICK_STOP_OPTION_STAY_ACTIVE when the cart isn't present to copy."""
-        lift = self.controllers.get("lift")
-        if lift is None:
-            return
-        cart = self.controllers.get("cart")
-        code = cart.get_quick_stop_option_code() if cart is not None else None
-        if code is None:
-            code = QUICK_STOP_OPTION_STAY_ACTIVE
-        lift.set_quick_stop_option_code(code)
 
     def _discover_modbus_tcp_buses(self):
         result = self._accessor.listAvailableBusHardware()
