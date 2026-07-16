@@ -4,9 +4,9 @@
     "jog_accel": 1000,
     "jog_jerk": 12000,
     "jog_speed": 500,
-    "kd": -0.05,
+    "kd": 0.0,
     "ki": -0.01,
-    "kp": -4.5,
+    "kp": -1.5,
     "max_speed": 600,
     "pid_accel": 18000,
     "pid_jerk": 18000
