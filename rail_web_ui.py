@@ -1737,6 +1737,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     def _snapshot(self):
         controllers = {}
         for name, ctrl in self.manager.controllers.items():
+            state = ctrl.get_state()
             controllers[name] = {
                 "connected": ctrl.connected,
                 "drive_enabled": ctrl.drive_enabled,
@@ -1746,7 +1747,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "homing_in_progress": ctrl.homing_in_progress,
                 "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
-                "state": ctrl.get_state(),
+                "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
+                "state": state,
                 "params": ctrl.get_params(),
             }
         return controllers
@@ -1769,6 +1771,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                             {"key": k, "label": lbl, "fmt": fmt}
                             for (k, _i, _s, _b, _sg, lbl, fmt) in ctrl.readout_specs
                         ],
+                        "down_limit": (LIFT_DOWN_POSITION_LIMIT
+                                       if ctrl.role == "lift" else None),
                     }
                     for name, ctrl in self.manager.controllers.items()
                 ],

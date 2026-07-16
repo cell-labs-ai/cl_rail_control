@@ -345,6 +345,14 @@ function buildPanel(ctrl) {
     root.querySelector(".flag-homing").remove();
   }
 
+  // Soft lower travel limit (LIFT_DOWN_POSITION_LIMIT) is lift-only and only
+  // shown when actually configured server-side (None disables it).
+  const downLimit = ctrl.down_limit;
+  const hasDownLimit = ctrl.role === "lift" && downLimit !== null && downLimit !== undefined;
+  if (!hasDownLimit) {
+    root.querySelector(".flag-down-limit").remove();
+  }
+
   // Split params between the PID card and the general Parameters card. In the
   // Parameters card, only jog speed stays visible; the rest collapse into a
   // "More parameters" disclosure that is closed by default.
@@ -411,14 +419,19 @@ function buildPanel(ctrl) {
   const flagDrive = root.querySelector(".flag-drive");
   const flagPid = root.querySelector(".flag-pid");
   const flagHoming = root.querySelector(".flag-homing");
+  const flagDownLimit = hasDownLimit ? root.querySelector(".flag-down-limit") : null;
   const flagNegLimit = root.querySelector(".flag-neg-limit");
   const flagPosLimit = root.querySelector(".flag-pos-limit");
   lockFlagWidth(flagConn, ["online", "offline"]);
   lockFlagWidth(flagDrive, ["driving +", "driving -", "enabled", "idle"]);
   lockFlagWidth(flagPid, ["PID on", "PID off"]);
   lockFlagWidth(flagHoming, ["homed", "homing…", "not homed ↑", "homing ?"]);
+  lockFlagWidth(flagDownLimit, ["down limit set", "AT DOWN LIMIT"]);
   lockFlagWidth(flagNegLimit, ["neg endstop", "NEG ENDSTOP"]);
   lockFlagWidth(flagPosLimit, ["pos endstop", "POS ENDSTOP"]);
+  if (flagDownLimit) {
+    flagDownLimit.title = `soft lower travel limit configured: position ≤ ${downLimit}`;
+  }
 
   panels[name] = {
     root,
@@ -431,6 +444,7 @@ function buildPanel(ctrl) {
       drive: flagDrive,
       pid: flagPid,
       homing: flagHoming,
+      downLimit: flagDownLimit,
       negLimit: flagNegLimit,
       posLimit: flagPosLimit,
     },
@@ -530,6 +544,16 @@ function updatePanel(name, data) {
     p.flags.homing.classList.toggle("on-conn", homed);
     p.flags.homing.classList.toggle("on-pid", !homed && !!data.homing_in_progress);
     p.flags.homing.classList.toggle("on-limit", data.homing_complete === false && !data.homing_in_progress);
+  }
+
+  // Soft lower travel limit (lift only, only present when LIFT_DOWN_POSITION_LIMIT
+  // is configured server-side). down_limit_active mirrors the poller's own
+  // _down_position_blocked() check, so this lights up exactly when the drive
+  // would be/was stopped by it.
+  if (p.flags.downLimit) {
+    const atLimit = !!data.down_limit_active;
+    p.flags.downLimit.textContent = atLimit ? "AT DOWN LIMIT" : "down limit set";
+    p.flags.downLimit.classList.toggle("on-limit", atLimit);
   }
 
   // End stops (60FDh bit 0 = negative limit switch, bit 1 = positive limit
