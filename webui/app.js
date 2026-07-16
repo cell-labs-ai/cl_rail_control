@@ -339,6 +339,12 @@ function buildPanel(ctrl) {
     root.querySelector(".flag-pid").remove();
   }
 
+  // Homing status is a lift-only concern (checked once at connect); the cart
+  // has no homing, so drop its flag.
+  if (ctrl.role !== "lift") {
+    root.querySelector(".flag-homing").remove();
+  }
+
   // Split params between the PID card and the general Parameters card. In the
   // Parameters card, only jog speed stays visible; the rest collapse into a
   // "More parameters" disclosure that is closed by default.
@@ -404,11 +410,13 @@ function buildPanel(ctrl) {
   const flagConn = root.querySelector(".flag-conn");
   const flagDrive = root.querySelector(".flag-drive");
   const flagPid = root.querySelector(".flag-pid");
+  const flagHoming = root.querySelector(".flag-homing");
   const flagNegLimit = root.querySelector(".flag-neg-limit");
   const flagPosLimit = root.querySelector(".flag-pos-limit");
   lockFlagWidth(flagConn, ["online", "offline"]);
   lockFlagWidth(flagDrive, ["driving +", "driving -", "enabled", "idle"]);
   lockFlagWidth(flagPid, ["PID on", "PID off"]);
+  lockFlagWidth(flagHoming, ["homed", "homing…", "not homed ↑", "homing ?"]);
   lockFlagWidth(flagNegLimit, ["neg endstop", "NEG ENDSTOP"]);
   lockFlagWidth(flagPosLimit, ["pos endstop", "POS ENDSTOP"]);
 
@@ -422,6 +430,7 @@ function buildPanel(ctrl) {
       conn: flagConn,
       drive: flagDrive,
       pid: flagPid,
+      homing: flagHoming,
       negLimit: flagNegLimit,
       posLimit: flagPosLimit,
     },
@@ -504,6 +513,25 @@ function updatePanel(name, data) {
     p.pidToggle.classList.toggle("running", data.pid_running);
   }
 
+  // Homing status (lift only). Until homed, the lift is UP-only: drive it up
+  // into the top end stop to home (method 35). true = homed, in-progress =
+  // homing running, false = not homed (down disabled), null = unknown.
+  if (p.flags.homing) {
+    const homed = data.homing_complete === true;
+    if (homed) {
+      p.flags.homing.textContent = "homed";
+    } else if (data.homing_in_progress) {
+      p.flags.homing.textContent = "homing…";
+    } else if (data.homing_complete === false) {
+      p.flags.homing.textContent = "not homed ↑";
+    } else {
+      p.flags.homing.textContent = "homing ?";
+    }
+    p.flags.homing.classList.toggle("on-conn", homed);
+    p.flags.homing.classList.toggle("on-pid", !homed && !!data.homing_in_progress);
+    p.flags.homing.classList.toggle("on-limit", data.homing_complete === false && !data.homing_in_progress);
+  }
+
   // End stops (60FDh bit 0 = negative limit switch, bit 1 = positive limit
   // switch). Null (not yet read / unavailable) reads as clear, not triggered.
   const state = data.state || {};
@@ -518,6 +546,12 @@ function updatePanel(name, data) {
   if (p.joystick) {
     p.joystick.limits.pos = !!state.pos_limit;
     p.joystick.limits.neg = !!state.neg_limit;
+    // Lift, not yet homed: lock out downward drive (down = negative axis) so the
+    // stick can only push up toward the top end stop. p.flags.homing exists on
+    // the lift only, so this never touches the cart.
+    if (p.flags.homing && data.homing_complete !== true) {
+      p.joystick.limits.neg = true;
+    }
   }
 
   // Readout.

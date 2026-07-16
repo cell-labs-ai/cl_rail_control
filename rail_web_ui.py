@@ -118,6 +118,62 @@ STATUSWORD_STATE_MASK = 0x6F
 STATUSWORD_QUICK_STOP_ACTIVE = 0x07
 STATUSWORD_OPERATION_ENABLED = 0x27
 
+# Quick Stop Option Code (605Ah): what the drive does on a quick stop (e.g. a
+# limit switch). Codes 5/6/7 brake and STAY in 'Quick stop active', so recovery
+# is the direct bit-2 edge (CiA-402 transition 16); codes 0/1/2 brake and drop
+# to 'Switch on disabled', forcing the long shutdown -> switch on -> enable path.
+# 6 = brake on the quick-stop ramp (6085h) and stay in Quick stop active. The
+# lift is synced to the cart's value at connect so both recover from an end stop
+# the same way (cart goes 0x9697 -> 0x96B7 directly; the lift otherwise detours
+# through 0x12C0 'Switch on disabled').
+OD_QUICK_STOP_OPTION_CODE = (0x605A, 0x00, 16)
+QUICK_STOP_OPTION_STAY_ACTIVE = 6
+
+# Homing mode (mode of operation 6). After connecting the lift we switch to it
+# once and read statusword bit 12 ("Homing attained") to record whether homing
+# has already been performed -- see C5-E manual p.79. If it has not, we run the
+# homing procedure with homing method 35 (6098h): take the CURRENT position as
+# the home/zero reference -- no motion (see C5-E manual "6098h Homing Method").
+DRIVE_MODE_HOMING = 6
+STATUSWORD_HOMING_ATTAINED_BIT = 12
+STATUSWORD_HOMING_ERROR_BIT = 13
+# Statusword bit 12 is mode-dependent: in Homing mode it is "Homing attained"
+# (above); in Profile Velocity mode it is the "Speed" flag -- 1 = speed is 0.
+# The lift jogs in Profile Velocity mode, so while it is being driven up into
+# the top end stop this reads back as "motor at standstill". Governed by the
+# velocity-threshold objects 606Fh / 6070h on the drive.
+STATUSWORD_SPEED_ZERO_BIT = 12
+OD_HOMING_METHOD = (0x6098, 0x00, 8)
+HOMING_METHOD_CURRENT_POSITION = 35
+# Controlword to start homing: Enable operation (0x0F) with bit 4 ("Homing
+# operation start", 0x10) set -- its 0 -> 1 edge kicks off the procedure.
+CONTROLWORD_START_HOMING = 0x1F
+# Bounded wait for the homing procedure to report attained (bit 12) or error
+# (bit 13). Method 35 is effectively instantaneous, but the poll stays generic.
+HOMING_TIMEOUT_S = 10.0
+HOMING_POLL_S = 0.05
+# Minimum gap between auto-homing attempts, so a homing that keeps failing (bad
+# drive config, etc.) retries at a slow, non-hammering cadence rather than every
+# poll cycle while the lift sits on the top end stop.
+HOMING_RETRY_INTERVAL_S = 5.0
+
+# Lift only: soft lower travel limit, as a Position actual value (6064h) count
+# relative to the home reference set at the top end stop when homing. Downward
+# motion (the negative jog direction) is blocked once the lift reaches this
+# position, so the payload can't be driven past the bottom of its travel.
+#
+# This is enforced in software (see _down_position_blocked / _enforce_down_limit)
+# because the lift runs in Profile Velocity mode, where the drive's own 607Dh
+# software position limits do not apply. It is NOT exposed in the UI -- set it
+# here to match the rig, e.g. jog down to the lowest safe point after homing and
+# read the Position actual value off the live readout.
+#
+# Assumes downward travel DECREASES the position count (home = top, down =
+# negative velocity), so the limit is the lowest (most negative) allowed
+# position and travel is blocked once position <= LIFT_DOWN_POSITION_LIMIT.
+# None disables the limit.
+LIFT_DOWN_POSITION_LIMIT = None
+
 # _ensure_operation_enabled() polls the statusword until the CiA-402 state
 # machine has worked through its enable transitions (each takes a controller
 # cycle), so it doesn't race ahead of the drive. Bounded by the timeout so a
@@ -145,6 +201,7 @@ ANALOG_INPUT_JUMP_THRESHOLD = 512
 # analog input.
 READOUT_SPECS = [
     ("status_word", 0x6041, 0x00, 16, False, "Drive state (6041h)", "statusword"),
+    ("position_actual", 0x6064, 0x00, 32, True, "Position actual value (6064h)", None),
     ("velocity_actual", 0x606C, 0x00, 32, True, "Velocity actual value (rpm)", None),
     ("torque_actual", 0x6077, 0x00, 16, True, "Torque actual value", None),
     ("error_count", 0x1003, 0x00, 8, False, "Error count", None),
@@ -185,6 +242,32 @@ def _operation_enabled(status_word):
     if status_word is None:
         return False
     return (status_word & STATUSWORD_STATE_MASK) == STATUSWORD_OPERATION_ENABLED
+
+
+def _decode_cia402_state(status_word):
+    """Decode statusword (6041h) into its CiA 402 state-machine state name
+    (mirrors decodeStatusword() in app.js). Returns the raw hex for any word
+    that doesn't match a known state."""
+    if status_word is None:
+        return "unknown"
+    sw = status_word & 0xFFFF
+    if (sw & 0x4F) == 0x00:
+        return "Not ready to switch on"
+    if (sw & 0x4F) == 0x40:
+        return "Switch on disabled"
+    if (sw & 0x6F) == 0x21:
+        return "Ready to switch on"
+    if (sw & 0x6F) == 0x23:
+        return "Switched on"
+    if (sw & 0x6F) == 0x27:
+        return "Operation enabled"
+    if (sw & 0x6F) == 0x07:
+        return "Quick stop active"
+    if (sw & 0x4F) == 0x0F:
+        return "Fault reaction active"
+    if (sw & 0x4F) == 0x08:
+        return "Fault"
+    return f"0x{sw:04X}"
 
 
 # ---------------------------------------------------------------------------
@@ -315,12 +398,24 @@ class RailController:
         self._state["pos_limit"] = None
         self._state_lock = threading.Lock()
         self._last_analog = None
+        self._last_state_name = None        # CiA 402 state, for change logging
 
         # Drive / status flags surfaced to the UI.
         self.drive_enabled = False          # Profile Velocity mode + operation enabled
         self.jog_direction = 0              # -1, 0, +1
         self.pid_running = False
         self.last_error = None
+        # Lift only: whether homing has been performed. Read once at connect via
+        # check_homing() (statusword bit 12); None until checked / on the cart,
+        # which has no homing. While this is not True, the lift is locked to
+        # UP-only motion (down disabled) until it is homed against the top end
+        # stop -- see jog()/_maybe_home_at_endstop().
+        self.homing_complete = None
+        # Lift only: set while the end-stop homing procedure is running in the
+        # background (so the poll thread fires it exactly once).
+        self.homing_in_progress = False
+        self._homing_thread = None
+        self._last_homing_attempt = 0.0     # monotonic time of last auto-home
 
         # Threads.
         self._stop_event = threading.Event()
@@ -385,7 +480,69 @@ class RailController:
                 snapshot = self._read_state()
             with self._state_lock:
                 self._state = snapshot
+            self._log_state_change(snapshot.get("status_word"))
+            self._maybe_home_at_endstop(snapshot)
+            self._enforce_down_limit(snapshot)
             self._stop_event.wait(STATE_POLL_INTERVAL_S)
+
+    def _log_state_change(self, status_word):
+        """Print a line to the terminal whenever this controller's CiA 402 state
+        machine (decoded from statusword 6041h) changes -- the first observed
+        state is logged too. Runs for both the cart and the lift (each poll
+        thread tracks its own last state)."""
+        if status_word is None:
+            return
+        state_name = _decode_cia402_state(status_word)
+        if state_name == self._last_state_name:
+            return
+        previous, self._last_state_name = self._last_state_name, state_name
+        arrow = f"{previous} -> " if previous is not None else ""
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} state: "
+              f"{arrow}{state_name} (0x{status_word & 0xFFFF:04X})")
+
+    def _enforce_down_limit(self, snapshot):
+        """Lift only: soft lower travel limit. If the lift is moving down and has
+        reached LIFT_DOWN_POSITION_LIMIT, command a stop so it can't run past the
+        bottom of its travel. This has to catch it live because a held joystick
+        keeps a steady down velocity with no further commands to gate."""
+        if self.jog_direction >= 0:
+            return
+        if self._down_position_blocked(snapshot.get("position_actual")):
+            self.jog_stop()
+            self.last_error = "lower travel limit reached -- stopped"
+
+    def _maybe_home_at_endstop(self, snapshot):
+        """Lift only: while the lift is not yet homed, watch for it resting on
+        the top end stop and, when it is, kick off the end-stop homing procedure
+        (method 35) in the background.
+
+        "Resting on the top end stop" = the motor has stopped (statusword bit 12
+        = speed 0, valid because we keep Profile Velocity selected outside
+        homing) AND the drive is at the positive limit -- either the limit switch
+        forced Quick stop active, or the positive-limit input (60FDh, the same
+        signal the jog code gates on) reads set. Covering both makes it robust to
+        how the end stop leaves the drive and lets a restart-on-the-end-stop
+        still home. homing_in_progress guards re-entry; the retry interval keeps
+        a persistently failing home from firing every poll cycle."""
+        if self.role != "lift" or self._simulate:
+            return
+        if self.homing_complete or self.homing_in_progress:
+            return
+        status_word = snapshot.get("status_word")
+        if status_word is None:
+            return
+        stopped = bool(status_word & (1 << STATUSWORD_SPEED_ZERO_BIT))
+        at_top = _quick_stop_active(status_word) or bool(snapshot.get("pos_limit"))
+        if not (stopped and at_top):
+            return
+        now = time.monotonic()
+        if now - self._last_homing_attempt < HOMING_RETRY_INTERVAL_S:
+            return
+        self._last_homing_attempt = now
+        self.homing_in_progress = True
+        self._homing_thread = threading.Thread(
+            target=self._run_endstop_homing, daemon=True)
+        self._homing_thread.start()
 
     def _read_state(self):
         snapshot = {}
@@ -543,7 +700,8 @@ class RailController:
     def _ensure_operation_enabled(self):
         """Make sure the drive is in 'Operation enabled' before jogging or
         starting the PID loop. Recovers from a limit-switch-triggered 'Quick
-        stop active' via _recover_from_endstop(); otherwise runs the normal
+        stop active' via _recover_from_endstop(), then -- if that did not land,
+        or the drive was in some other non-enabled state -- runs the full
         enable_drive() sequence and waits for it to land. Both paths wait for
         the state machine to actually reach Operation enabled rather than
         racing a single read ahead of the drive (that race is why jog used to
@@ -557,7 +715,14 @@ class RailController:
 
         if _quick_stop_active(status_word):
             status_word = self._recover_from_endstop()
-        elif not _operation_enabled(status_word):
+        # Fall through to the full enable sequence if we are still not enabled --
+        # either the drive was never in Quick stop active, or the bit-2 recovery
+        # above did not land because the end stop dropped the drive to 'Switch on
+        # disabled' (605Ah option code 2) rather than holding 'Quick stop active'
+        # (from there only the full sequence re-enables). This mirrors the robust
+        # re-enable the homing path uses, so the cart and lift recover from an
+        # end stop the same way regardless of each drive's quick-stop config.
+        if not _operation_enabled(status_word):
             if not self.enable_drive():
                 return False
             status_word = self._wait_for_operation_enabled()
@@ -570,6 +735,52 @@ class RailController:
         self.last_error = None
         self.drive_enabled = True
         return True
+
+    def _enable_keep_mode(self):
+        """Bring the drive to 'Operation enabled' WITHOUT changing the selected
+        mode of operation -- the mode-preserving sibling of
+        _ensure_operation_enabled(), used by homing (which must stay in Homing
+        mode; enable_drive() would force Profile Velocity).
+
+        It takes the SAME branch _ensure_operation_enabled() does, which is how
+        the rest of the code recovers from an end stop:
+
+          * 'Quick stop active' (the limit switch forced it there and 605Ah kept
+            it energized) -> _recover_from_endstop()'s controlword bit-2 edge
+            (CiA-402 transition 16);
+          * otherwise -> walk shutdown -> switch on -> enable operation
+            (0x06 -> 0x07 -> 0x0F), but WITHOUT the mode write.
+
+        The second branch is what the plain _recover_from_endstop() lacked: some
+        end stops (605Ah option code 2) ramp the drive down and drop it to
+        'Switch on disabled' instead of holding 'Quick stop active', and from
+        there only the full sequence re-enables it. Returns the last statusword;
+        commands no motion (target velocity held at 0, controlword bit 4 = 0)."""
+        self._write(OD_TARGET_VELOCITY, 0)
+        status_word = self._read(OD_STATUS_WORD)
+        if _quick_stop_active(status_word):
+            return self._recover_from_endstop()
+        if _operation_enabled(status_word):
+            return status_word
+        # Switch on disabled / ready / switched on: walk the state machine, but
+        # do NOT select a mode of operation, so Homing mode stays put.
+        self._write(OD_NANOJ_CONTROL, 0)
+        for command in (0x06, 0x07, 0x0F):
+            self._write(OD_CONTROL_WORD, command)
+        return self._wait_for_operation_enabled()
+
+    def get_quick_stop_option_code(self):
+        """Read 605Ah (Quick Stop Option Code); None on error or in simulate."""
+        if self._simulate:
+            return None
+        raw = self._read(OD_QUICK_STOP_OPTION_CODE)
+        return None if raw is None else _to_signed(raw & 0xFFFF, 16)
+
+    def set_quick_stop_option_code(self, value):
+        """Write 605Ah (Quick Stop Option Code). No-op (True) in simulate."""
+        if self._simulate:
+            return True
+        return self._write(OD_QUICK_STOP_OPTION_CODE, int(value))
 
     def set_target_velocity(self, rpm):
         if self._simulate:
@@ -590,6 +801,31 @@ class RailController:
         return ok
 
     # -- manual jog (hold-to-jog) -----------------------------------------
+
+    def _down_locked(self, direction):
+        """Lift only: until the lift is homed, downward motion is disabled so the
+        operator can only drive UP into the top end stop to home it. 'Down' is
+        the negative direction (up = +1 for the lift). Sets last_error and
+        returns True when a move should be blocked. The cart, and a homed lift,
+        are never locked."""
+        if self.role != "lift" or self.homing_complete or direction >= 0:
+            return False
+        self.last_error = ("lift not homed -- drive UP into the top end stop to "
+                           "home first (down disabled)")
+        return True
+
+    def _down_position_blocked(self, position=None):
+        """Lift only: True if the soft lower travel limit
+        (LIFT_DOWN_POSITION_LIMIT) is configured and the lift has reached it, so
+        downward motion must be blocked/stopped. Only meaningful once homed (the
+        limit is relative to the home reference). Uses the given Position actual
+        value (6064h), or the poller's latest when not supplied."""
+        if (self.role != "lift" or LIFT_DOWN_POSITION_LIMIT is None
+                or not self.homing_complete):
+            return False
+        if position is None:
+            position = self.get_state().get("position_actual")
+        return position is not None and position <= LIFT_DOWN_POSITION_LIMIT
 
     def jog(self, direction):
         """Start jogging: direction is -1, 0 or +1. Enables the drive on
@@ -613,6 +849,11 @@ class RailController:
             return self.jog_stop()
         if self.pid_running:
             return False, "stop the PID loop before jogging"
+        if self._down_locked(direction):
+            return False, self.last_error
+        if direction < 0 and self._down_position_blocked():
+            self.last_error = "lower travel limit reached -- down disabled"
+            return False, self.last_error
 
         state = self.get_state()
         if direction > 0 and state.get("pos_limit"):
@@ -662,6 +903,11 @@ class RailController:
         direction = (velocity > 0) - (velocity < 0)
         if direction == 0:
             return self.jog_stop()
+        if self._down_locked(direction):
+            return False, self.last_error
+        if direction < 0 and self._down_position_blocked():
+            self.last_error = "lower travel limit reached -- down disabled"
+            return False, self.last_error
 
         state = self.get_state()
         if direction > 0 and state.get("pos_limit"):
@@ -697,6 +943,112 @@ class RailController:
     # The readout above already works for the lift unchanged. These wrappers
     # give the payload winch its own up/down semantics. For now they are the
     # generic jog; fill in the real behaviour later.
+
+    def check_homing(self):
+        """Lift only: select Homing mode (mode of operation 6) and read
+        statusword bit 12 ("Homing attained", C5-E manual p.79) to record
+        whether homing has already been performed. The result is stored on
+        self.homing_complete and surfaced to the UI ("homing complete").
+
+        Called once right after connecting, before normal operation. It only
+        reads (operation is not enabled, no motion is commanded). It then
+        restores Profile Velocity mode, so outside the homing procedure the
+        drive is always in velocity mode -- keeping statusword bit 12 meaningful
+        as the speed-0 flag (used to spot the lift resting on the end stop) and
+        never leaving it stranded in Homing mode. Returns True if the statusword
+        was read, False otherwise (homing_complete left None)."""
+        if self._simulate:
+            self.homing_complete = True
+            return True
+        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
+        status_word = self._read(OD_STATUS_WORD)
+        self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
+        if status_word is None:
+            self.homing_complete = None
+            return False
+        self.homing_complete = bool(status_word & (1 << STATUSWORD_HOMING_ATTAINED_BIT))
+        return True
+
+    def _run_endstop_homing(self):
+        """Lift only: home against the top end stop with homing method 35 (take
+        the current position as the home reference -- no motion; see C5-E manual
+        "6098h Homing Method").
+
+        Entered on a background thread by _maybe_home_at_endstop() once the lift,
+        driven up while unhomed, has come to rest against the upper end stop (the
+        limit switch forced Quick stop active and the motor has stopped). It:
+
+          1. selects Homing mode (6060h = 6) and writes homing method 35;
+          2. recovers out of Quick stop active back to Operation enabled
+             (_recover_from_endstop) and KEEPS the drive enabled throughout;
+          3. starts homing with a rising edge on controlword bit 4 (0x1F) and
+             waits for bit 12 "Homing attained" / bit 13 "Homing error"; then
+          4. on success, hands the drive back to normal operation -- reselects
+             Profile Velocity, target velocity 0, still in Operation enabled --
+             and _wait_for_homing() sets homing_complete = True, which lifts the
+             down-motion lock. On failure the lock stays in place.
+
+        homing_in_progress guards re-entry; it is always cleared on exit."""
+        try:
+            if self._simulate:
+                self.homing_complete = True
+                return
+
+            self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
+            self._write(OD_HOMING_METHOD, HOMING_METHOD_CURRENT_POSITION)
+
+            # Re-enable at the end stop, keeping Homing mode. _enable_keep_mode()
+            # handles BOTH ways the end stop can leave the drive -- still in
+            # Quick stop active, or dropped to Switch on disabled -- which is why
+            # the plain bit-2 edge alone previously failed here.
+            status_word = self._enable_keep_mode()
+            if not _operation_enabled(status_word):
+                self.homing_complete = False
+                self.last_error = "homing: could not re-enable drive at end stop"
+                return
+
+            # Rising edge on controlword bit 4 starts the homing operation.
+            if not self._write(OD_CONTROL_WORD, CONTROLWORD_START_HOMING):
+                self.homing_complete = False
+                self.last_error = self.last_error or "homing: failed to start"
+                return
+
+            self._wait_for_homing()   # sets homing_complete + last_error
+        finally:
+            # Always hand the drive back in Profile Velocity, holding zero
+            # velocity -- even on failure, so it is never stranded in Homing mode
+            # (which would break the speed-0 detection and the next jog). On a
+            # successful home this leaves the lift enabled at standstill with the
+            # down lock lifted; the down lock stays on if homing did not attain.
+            if not self._simulate:
+                self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
+                self._write(OD_TARGET_VELOCITY, 0)
+                self._write(OD_CONTROL_WORD, 0x0F)
+                self.drive_enabled = _operation_enabled(self._read(OD_STATUS_WORD))
+                self.jog_direction = 0
+            self.homing_in_progress = False
+
+    def _wait_for_homing(self):
+        """Poll statusword (6041h) until the homing procedure reports attained
+        (bit 12) or error (bit 13); gives up after HOMING_TIMEOUT_S. Sets
+        self.homing_complete and returns (ok, message)."""
+        deadline = time.monotonic() + HOMING_TIMEOUT_S
+        while True:
+            status_word = self._read(OD_STATUS_WORD)
+            if status_word is not None:
+                if status_word & (1 << STATUSWORD_HOMING_ERROR_BIT):
+                    self.homing_complete = False
+                    self.last_error = "homing error (statusword bit 13)"
+                    return False, self.last_error
+                if status_word & (1 << STATUSWORD_HOMING_ATTAINED_BIT):
+                    self.homing_complete = True
+                    self.last_error = None
+                    return True, "ok"
+            if time.monotonic() >= deadline:
+                self.homing_complete = False
+                self.last_error = "homing timed out"
+                return False, self.last_error
+            time.sleep(HOMING_POLL_S)
 
     def lift_up(self):
         # TODO(lift): enforce upper travel limit / max payload height, and
@@ -814,6 +1166,9 @@ class RailController:
         # First-order velocity ramp toward the commanded target.
         self._sim_velocity += (self._sim_target_velocity - self._sim_velocity) * min(1.0, dt * 5)
 
+        # Integrate velocity into a fake position actual value (6064h).
+        self._sim_position += self._sim_velocity * dt
+
         # Pendulum-ish angle: driven by velocity, plus a slow idle sway.
         self._sim_angle += -self._sim_velocity * dt * 0.05
         self._sim_angle += math.sin(now * 0.7) * 2.0 * dt
@@ -827,6 +1182,7 @@ class RailController:
         # No physical limit switches to simulate; report both clear.
         return {
             "status_word": status_word,
+            "position_actual": int(self._sim_position),
             "velocity_actual": int(self._sim_velocity),
             "torque_actual": int(self._sim_velocity * 0.1),
             "error_count": 0,
@@ -883,6 +1239,12 @@ class ControllerManager:
                 ctrl = RailController(name, suffix, None, None, self._bus_lock,
                                       simulate=True, role=role)
                 ctrl.start()
+                # Lift only: check homing (statusword bit 12) once at connect.
+                # If not homed, the lift stays UP-only until it is homed against
+                # the top end stop (the poll loop watches for that); it is not
+                # homed here. (In simulate, check_homing reports it homed.)
+                if role == "lift":
+                    ctrl.check_homing()
                 self.controllers[name] = ctrl
             return
 
@@ -941,6 +1303,14 @@ class ControllerManager:
                     ctrl = RailController(name, matched, self._accessor, handle,
                                           self._bus_lock, simulate=False, role=role)
                     ctrl.start()
+                    # Lift only: switch to Homing mode (mode of operation 6) and
+                    # read statusword bit 12 once. If not homed, the lift is held
+                    # UP-only until the operator drives it up into the top end
+                    # stop, where the poll loop auto-homes it (method 35).
+                    if role == "lift":
+                        ctrl.check_homing()
+                        print(f"  --> {name.upper()}: homing "
+                              f"{'complete' if ctrl.homing_complete else 'NOT performed -- drive up to home (down disabled)'}")
                     self.controllers[name] = ctrl
                     found[matched] = handle
                 else:
@@ -955,9 +1325,27 @@ class ControllerManager:
             if len(found) == len(wanted):
                 break
 
+        # Make the lift recover from an end stop the same way the cart does.
+        self._sync_lift_quick_stop_to_cart()
+
         for name, suffix, _role in self.TARGETS:
             if name not in self.controllers:
                 print(f"WARNING: {name} controller (serial ...{suffix}) not found.")
+
+    def _sync_lift_quick_stop_to_cart(self):
+        """Give the lift the cart's Quick Stop Option Code (605Ah) so both
+        recover from an end stop identically: staying in 'Quick stop active' for
+        the direct bit-2 recovery (CiA-402 transition 16) rather than dropping to
+        'Switch on disabled' and taking the long way back. Falls back to
+        QUICK_STOP_OPTION_STAY_ACTIVE when the cart isn't present to copy."""
+        lift = self.controllers.get("lift")
+        if lift is None:
+            return
+        cart = self.controllers.get("cart")
+        code = cart.get_quick_stop_option_code() if cart is not None else None
+        if code is None:
+            code = QUICK_STOP_OPTION_STAY_ACTIVE
+        lift.set_quick_stop_option_code(code)
 
     def _discover_modbus_tcp_buses(self):
         result = self._accessor.listAvailableBusHardware()
@@ -1117,6 +1505,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "drive_enabled": ctrl.drive_enabled,
                 "jog_direction": ctrl.jog_direction,
                 "pid_running": ctrl.pid_running,
+                "homing_complete": ctrl.homing_complete,
+                "homing_in_progress": ctrl.homing_in_progress,
                 "last_error": ctrl.last_error,
                 "state": ctrl.get_state(),
                 "params": ctrl.get_params(),
