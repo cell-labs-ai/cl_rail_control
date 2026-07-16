@@ -217,7 +217,7 @@ VELOCITY_ZERO_RPM = 5
 # negative velocity), so the limit is the lowest (most negative) allowed
 # position and travel is blocked once position <= LIFT_DOWN_POSITION_LIMIT.
 # None disables the limit.
-LIFT_DOWN_POSITION_LIMIT = None
+LIFT_DOWN_POSITION_LIMIT = -120000
 
 # _walk_to_operation_enabled() steps the CiA-402 state machine one confirmed
 # transition at a time. The timeout must cover the lift's automatic brake
