@@ -137,7 +137,7 @@ OD_MOTOR_CURRENT_ACTUAL = (0x2039, 0x05, 32)
 # heartbeats per 100 ms window. Over WiFi a single retransmit can eat most of
 # that margin -- if nuisance stops occur, raise TimeOut in the NanoJ program
 # rather than shortening the interval (the bus is shared with the state
-# poller and the 50 Hz PID loop, so more writes just add congestion).
+# poller and the 100 Hz PID loop, so more writes just add congestion).
 OD_HEARTBEAT = (0x2400, 0x01, 32)
 HEARTBEAT_INTERVAL_S = 0.1
 # The counter stays in 1..HEARTBEAT_MAX (S32 positive range): 0 is skipped
@@ -401,7 +401,7 @@ PID_SETPOINT = round(ANALOG_INPUT_MAX / 2)
 PID_DERIVATIVE_TAU_S = 0.1
 PID_INTEGRAL_LIMIT = 200
 PID_INTEGRAL_LEAK_RATE = 0.1
-PID_INTERVAL_S = 0.02          # 50 Hz, matches motion_test.py
+PID_INTERVAL_S = 0.01          # 100 Hz (motion_test.py runs 50 Hz)
 PID_MAX_DT_S = 5 * PID_INTERVAL_S
 
 
@@ -535,6 +535,25 @@ class RailController:
             result = self._accessor.readNumber(
                 self._handle, Nanolib.OdIndex(index, sub))
         return None if result.hasError() else result.getResult()
+
+    def _read_angle(self):
+        """Fresh Analog Input 1 read for the PID loop (one bus round trip).
+
+        The poller snapshot only refreshes every STATE_POLL_INTERVAL_S
+        (10 Hz), so a 100 Hz PID loop fed from it sees each angle sample up
+        to 100 ms late and unchanged for ~9 of 10 iterations -- the D term
+        differentiates a staircase and the loop oscillates. Reading the
+        sensor directly gives every PID iteration a current angle. Goes
+        through the same wrap-around clamp as the poller; on a failed read
+        the clamp returns the last good value (or None if there has never
+        been one), so a transient bus error coasts for a cycle instead of
+        kicking the pendulum."""
+        if self._simulate:
+            return int(self._sim_angle)
+        raw = self._read(OD_ANALOG_INPUT_1)
+        if raw is not None:
+            raw &= (1 << OD_ANALOG_INPUT_1[2]) - 1
+        return self._clamp_analog_jump(raw)
 
     def _write(self, od, value):
         """Write a single OD index, returning True on success. Bus-locked."""
@@ -1345,23 +1364,34 @@ class RailController:
         every iteration, so the UI retunes it on the fly; the setpoint is
         fixed (PID_SETPOINT) and no longer part of the UI.
 
+        The angle is read fresh from the bus every iteration (_read_angle):
+        the poller snapshot only updates at 10 Hz, and feeding that to a
+        100 Hz loop adds up to 100 ms of sensor delay -- enough phase lag to
+        drive a fast oscillation at the pendulum's natural frequency.
+
         End stops: unlike jog(), the PID output can swing into a limit
         switch mid-run rather than only when a fixed direction is first
         commanded, so this checks on every iteration instead of only at
-        start_pid(). Uses the poller's cached state (cheap, no bus round
-        trip) to clamp velocity away from a triggered switch and to detect
-        Quick stop active; _ensure_operation_enabled() -- with its own
-        fresh read -- is only actually invoked (bus round trip(s)) when
-        that cached state suggests it's needed.
+        start_pid(). The poller's cached state (cheap, no bus round trip)
+        is still used for that gating -- limit switches and Quick stop
+        don't need 100 Hz freshness -- and _ensure_operation_enabled(),
+        with its own fresh read, is only actually invoked (bus round
+        trip(s)) when that cached state suggests it's needed.
+
+        Paced against a monotonic deadline like _heartbeat_loop: each
+        iteration now spends two bus round trips (angle read + velocity
+        write), and sleeping the full interval on top of that would
+        stretch the effective period well past the 10 ms target.
         """
         integral = 0.0
         filtered_rate = 0.0
         last_angle = None
         last_time = None
+        next_tick = time.monotonic()
 
         while not self._pid_stop.is_set():
             state = self.get_state()
-            angle = state.get("analog_input_1")
+            angle = self._read_angle()
             p = self.get_params()
             now = time.monotonic()
 
@@ -1399,7 +1429,15 @@ class RailController:
 
                 self.set_target_velocity(round(velocity))
 
-            self._pid_stop.wait(PID_INTERVAL_S)
+            next_tick += PID_INTERVAL_S
+            delay = next_tick - time.monotonic()
+            if delay <= 0:
+                # The bus round trips overran the interval: re-anchor and run
+                # the next iteration immediately rather than bursting to
+                # catch up.
+                next_tick = time.monotonic()
+                continue
+            self._pid_stop.wait(delay)
 
         self.set_target_velocity(0)
 
