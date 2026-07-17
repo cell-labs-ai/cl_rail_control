@@ -7,11 +7,17 @@
     "kd": 0.0,
     "ki": -0.01,
     "kp": -1.5,
+    "length_comp": 1,
     "max_speed": 600,
     "pid_accel": 18000,
     "pid_jerk": 18000
   },
   "lift": {
-    "jog_speed": 400
+    "jog_speed": 400,
+    "walk_catch_accel": 500,
+    "walk_catch_ma": 3500,
+    "walk_lower_speed": 200,
+    "walk_tension_ma": 200,
+    "walk_touchdown_ma": 300
   }
 }
