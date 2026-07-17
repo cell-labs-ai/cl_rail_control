@@ -90,8 +90,24 @@ LIFT_SERIAL_SUFFIX = "0173"   # payload lift (template)
 #                closed) after LIFT_IDLE_STOP_TIMEOUT_S of no up or down
 #                movement, so the load never hangs on motor current alone
 #                for long. See _maybe_idle_stop().
-#   * walking -- behaviour to be defined; currently identical to basic minus
-#                the lift idle auto-stop.
+#   * walking -- auto-lower + rope tension (see _run_walk_lower). On entering
+#                the mode, the lift (must be homed) drives down at
+#                walk_lower_speed while watching the motor current
+#                (2039h:05h); when the payload grounds, the load transfers
+#                off the rope and the current magnitude drops below
+#                walk_touchdown_ma -> touchdown. The drive then STAYS in
+#                Operation enabled / Profile Velocity: Max Motor Current
+#                (2031h) is lowered to walk_tension_ma and the velocity
+#                command reversed upward, so the motor reels in slack and
+#                stalls against the payload, keeping the rope tensioned.
+#                Once stalled, the target velocity is zeroed and 2031h goes
+#                to 0 (no torque; mode and enable state stay untouched); the
+#                fall catch watches the drum: acceleration more negative
+#                than walk_catch_accel (a falling payload back-driving the
+#                torqueless drum) slams 2031h to walk_catch_ma -- with the
+#                target at 0, the drive arrests the fall and holds. The
+#                original 2031h is restored whenever the sequence ends. No
+#                lift idle auto-stop in this mode.
 
 MODE_BASIC = "basic"
 MODE_WALKING = "walking"
@@ -106,6 +122,73 @@ DEFAULT_MODE = MODE_BASIC
 # threshold) -- for this long, stop the motor like the STOP button does
 # (stop_motor: ramp to zero, drop out of Operation enabled, brake closes).
 LIFT_IDLE_STOP_TIMEOUT_S = 10.0
+
+# Walking mode, part 1: auto-lower (see _run_walk_lower). The descent speed and
+# the touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can
+# be calibrated live from the UI; the loop pacing and debounce live here.
+#
+# The touchdown detector is only ARMED once |606Ch| has reached this fraction
+# of the commanded descent speed -- the current is not meaningful during the
+# acceleration ramp and would false-trigger the threshold.
+WALK_ARM_VELOCITY_FRACTION = 0.8
+# One touchdown check per interval (two bus round trips: fresh current +
+# velocity reads). 10 Hz keeps the shared WiFi bus load moderate; with the
+# debounce below, detection lags touchdown by a few hundred ms, which merely
+# pays out a little extra rope -- harmless.
+WALK_POLL_INTERVAL_S = 0.1
+# Consecutive samples with |current| below the threshold before it counts as
+# touchdown, so a single noisy/low sample can't stop the descent early.
+WALK_TOUCHDOWN_SAMPLES = 3
+# Descent that neither touches down nor hits a limit within this long is
+# aborted (stop, brake closed) -- covers a miscalibrated threshold with the
+# soft down limit disabled.
+WALK_LOWER_TIMEOUT_S = 180.0
+
+# Walking mode, part 2: tension phase (see _run_walk_lower). After touchdown
+# the drive stays in Operation enabled / Profile Velocity; Max Motor Current
+# (2031h) is lowered to the walk_tension_ma param and the target velocity
+# reversed upward, so the motor reels in slack but stalls against the grounded
+# payload's weight, holding the rope at tension current. Once that stall is
+# seen, 2031h goes to 0 (no torque at all) with mode / enable / commanded
+# velocity untouched.
+#
+# Stall = |606Ch| at standstill for this many consecutive samples ...
+WALK_STALL_SAMPLES = 3
+# ... but only once the detector is armed: either the lift was seen actually
+# moving up (reeling slack), or this long has passed since the tension phase
+# started -- covers a touchdown with so little slack that the reel-in stalls
+# before ever reaching detectable speed. Needed because velocity passes
+# through zero anyway while reversing from the descent.
+WALK_TENSION_ARM_TIMEOUT_S = 3.0
+
+# Walking mode, part 3: fall catch (see _run_walk_lower phase 3). While the
+# current is zeroed, the drum is torqueless and a falling payload back-drives
+# it: velocity ramps NEGATIVE fast (desired/normal motion is downwards, i.e.
+# negative, so the sign convention matches pay-out). The watch differentiates
+# consecutive fresh 606Ch reads; an acceleration at or below
+# -walk_catch_accel (rpm/s) for this many consecutive sample pairs restores
+# torque by writing walk_catch_ma to 2031h. Two samples (~200 ms at the
+# 10 Hz loop) so one glitched read can't slam full current on spuriously;
+# every extra sample is fall distance, so no more than that.
+WALK_CATCH_SAMPLES = 2
+
+# Simulate only: gravity's pull on the fake falling payload, in rpm/s of drum
+# speed. Started via POST /api/lift/sim_fall (simulate mode only).
+SIM_FALL_ACCEL_RPM_S = 800
+
+# Simulate only: the position (6064h counts) where the fake payload "touches
+# ground". Below it the load is off the rope: the drum keeps unwinding (slack
+# rope, like the real rig), but the simulated motor current collapses to a
+# small friction term (see _sim_current), so the touchdown detector fires and
+# the whole auto-lower sequence is exercisable without hardware.
+SIM_GROUND_POSITION = -2000
+# Simulate only: stand-ins for the current-limit physics. The fake payload
+# "needs" SIM_LIFT_HOLD_CURRENT_MA to be lifted: with 2031h limited below
+# that, upward motion stalls at the taut-rope position (SIM_GROUND_POSITION);
+# with the limit at 0 the drum produces no torque and stands still.
+# SIM_MAX_CURRENT_MA is what a 2031h read returns in simulate.
+SIM_MAX_CURRENT_MA = 2000
+SIM_LIFT_HOLD_CURRENT_MA = 800
 
 # Poll rate for the live readout shown in the UI. Slower than motion_test.py's
 # 50 Hz control poll -- this only feeds a browser display and shares the bus
@@ -148,6 +231,14 @@ DIGITAL_OUTPUT_BIT_BRAKE = 0
 # sign of Iq. INTEGER32 (signed). See C5-E manual chapter 10 "2039h Motor
 # Currents". Comparable to the current from 6075h/2031h/203Bh:05h.
 OD_MOTOR_CURRENT_ACTUAL = (0x2039, 0x05, 32)
+
+# Max Motor Current (2031h:00h, UNSIGNED32, mA): "all current values are
+# limited by this value" (C5-E manual chapter 10). The Walking-mode tension
+# phase lowers it at runtime to turn the velocity-mode drive into a
+# tension-limited winch, and MUST restore the original afterwards -- with it
+# lowered, the lift cannot produce lifting torque. Runtime writes are
+# RAM-only, so a power cycle also restores the drive's saved value.
+OD_MAX_MOTOR_CURRENT = (0x2031, 0x00, 32)
 
 # Connection watchdog heartbeat. Each controller runs a NanoJ program that
 # maps user object 2400h:01h ("NodeGuard", S32) as input and stops the drive
@@ -395,6 +486,34 @@ JOG_SPECS_LIFT = [
      "default": 400, "min": 50, "max": 500, "step": 10, "software": True},
 ]
 
+# Walking-mode auto-lower (lift only, see _run_walk_lower). walk_lower_speed is
+# the constant descent speed; walk_touchdown_ma is the |Actual Current|
+# (2039h:05h, mA) below which the payload counts as grounded. Calibrate the
+# threshold from the live readout: note the current while lowering the hanging
+# payload vs. after it has settled on the ground, and pick a value in between.
+WALK_SPECS_LIFT = [
+    {"key": "walk_lower_speed", "label": "Walk lower speed (rpm)", "kind": "slider", "group": "walk",
+     "default": 200, "min": 20, "max": 400, "step": 10, "software": True},
+    {"key": "walk_touchdown_ma", "label": "Touchdown current (mA)", "kind": "number", "group": "walk",
+     "default": 300, "min": 10, "max": 5000, "step": 10, "software": True},
+    # Max Motor Current (2031h) during the tension phase: high enough to reel
+    # in slack rope against drum/gear friction, low enough that the motor
+    # stalls instead of lifting the grounded payload. Applied at touchdown.
+    {"key": "walk_tension_ma", "label": "Tension current (mA)", "kind": "number", "group": "walk",
+     "default": 200, "min": 0, "max": 2000, "step": 10, "software": True},
+    # Fall catch (zero-current phase): trip when the drum accelerates
+    # downwards (negative) faster than this, in rpm of 606Ch per second.
+    # Normal robot walking pays rope out gently; a fall back-drives the drum
+    # with a much steeper ramp. Calibrate against the rig's gearing.
+    {"key": "walk_catch_accel", "label": "Catch acceleration (rpm/s)", "kind": "number", "group": "walk",
+     "default": 500, "min": 50, "max": 10000, "step": 10, "software": True},
+    # 2031h value slammed in when the catch trips -- must be enough torque to
+    # arrest the falling payload; mind the motor's rating, this is written as
+    # the drive's max current limit.
+    {"key": "walk_catch_ma", "label": "Catch current (mA)", "kind": "number", "group": "walk",
+     "default": 3500, "min": 100, "max": 6000, "step": 50, "software": True},
+]
+
 # Software PID balance loop (cart only -- see run_pid_loop / motion_test.py).
 # Every value is kept in software and pushed to the drive when the loop starts
 # (see _apply_motion_profile). The setpoint is not exposed in the UI; it is
@@ -420,11 +539,11 @@ PID_PARAM_SPECS = [
      "default": 18000, "min": 12000, "max": 200000, "step": 100, "software": True},
 ]
 
-# Per-role parameter schema. The cart carries the PID tuning set; the lift is
-# jog-speed-only.
+# Per-role parameter schema. The cart carries the PID tuning set; the lift
+# carries the jog speed plus the Walking-mode auto-lower calibration.
 PARAM_SPECS_BY_ROLE = {
     "cart": JOG_SPECS_CART + PID_PARAM_SPECS,
-    "lift": JOG_SPECS_LIFT,
+    "lift": JOG_SPECS_LIFT + WALK_SPECS_LIFT,
 }
 
 # PID loop constants that are not exposed as tunable params (from motion_test.py).
@@ -524,6 +643,13 @@ class RailController:
         # Monotonic time since when the lift has been enabled but motionless
         # (see _maybe_idle_stop); None while moving / not applicable.
         self._idle_since = None
+        # Walking-mode auto-lower (lift only, see _run_walk_lower). walk_status
+        # is surfaced to the UI: None (inactive), "lowering", "touchdown" or
+        # "aborted". The stop event cancels a running descent; manual drive and
+        # STOP set it too, so the walk thread can never fight another command.
+        self.walk_status = None
+        self._walk_thread = None
+        self._walk_stop = threading.Event()
 
         # Drive / status flags surfaced to the UI.
         self.drive_enabled = False          # Profile Velocity mode + operation enabled
@@ -553,6 +679,12 @@ class RailController:
         self.heartbeat_ok = None
 
         # Simulation state (only used when self._simulate).
+        # _sim_current_limit mirrors 2031h writes (None = never touched); the
+        # stall model in _simulate_state keys on it. _sim_falling (set via
+        # POST /api/lift/sim_fall) makes gravity back-drive the torqueless
+        # drum so the fall catch is exercisable without hardware.
+        self._sim_current_limit = None
+        self._sim_falling = False
         self._sim_velocity = 0.0
         self._sim_position = 0.0
         self._sim_angle = ANALOG_INPUT_MAX / 2
@@ -585,6 +717,7 @@ class RailController:
 
     def stop(self):
         self.stop_pid()
+        self._cancel_walk()
         if self.connected and not self._simulate:
             try:
                 self.stop_motor()
@@ -703,9 +836,21 @@ class RailController:
     def set_mode(self, mode):
         """Apply the system-wide operating mode to this controller. The idle
         timer restarts so a mode switch always grants a fresh
-        LIFT_IDLE_STOP_TIMEOUT_S window."""
-        self.mode = mode
+        LIFT_IDLE_STOP_TIMEOUT_S window.
+
+        Lift only: entering Walking starts the auto-lower (the lift DRIVES
+        DOWN, if homed -- see start_walk_lower); leaving Walking cancels a
+        descent still in progress (the walk thread stops the motor, brake
+        closed)."""
+        previous, self.mode = self.mode, mode
         self._idle_since = None
+        if self.role != "lift" or mode == previous:
+            return
+        if mode == MODE_WALKING:
+            self.start_walk_lower()
+        else:
+            self._walk_stop.set()
+            self.walk_status = None
 
     def _maybe_idle_stop(self, snapshot):
         """Basic mode, lift only: stop the drive like the STOP button does
@@ -735,6 +880,377 @@ class RailController:
               f"for {LIFT_IDLE_STOP_TIMEOUT_S:.0f}s in Basic mode -- "
               f"auto-stop (brake closed)")
         self.stop_motor()
+
+    # -- Walking mode: auto-lower, then rope tension -----------------------
+
+    def _read_max_current(self):
+        """Max Motor Current (2031h, mA, unsigned) as currently set on the
+        drive -- read before the tension phase lowers it, so it can be
+        restored. None on read error."""
+        if self._simulate:
+            return SIM_MAX_CURRENT_MA
+        return self._read(OD_MAX_MOTOR_CURRENT)
+
+    def _set_max_current(self, ma):
+        """Write Max Motor Current (2031h). In simulate the value feeds the
+        stall model in _simulate_state instead of a drive."""
+        if self._simulate:
+            self._sim_current_limit = int(ma)
+            return True
+        return self._write(OD_MAX_MOTOR_CURRENT, int(ma))
+
+    def _sim_current(self):
+        """Simulated Actual Current (mA), velocity-proportional. Lift only:
+        below SIM_GROUND_POSITION the payload rests on the fake ground, the
+        rope is slack, and only a small friction term remains -- that drop is
+        what the touchdown detector keys on."""
+        grounded = (self.role == "lift"
+                    and self._sim_position <= SIM_GROUND_POSITION)
+        return int(self._sim_velocity * (0.2 if grounded else 2.0))
+
+    def _read_current(self):
+        """Fresh Actual Current (2039h:05h, mA, signed) read for the touchdown
+        detector -- like _read_angle, the 10 Hz poller snapshot is too stale to
+        feed a detection loop. None on read error."""
+        if self._simulate:
+            return self._sim_current()
+        raw = self._read(OD_MOTOR_CURRENT_ACTUAL)
+        return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
+
+    def _cancel_walk(self, wait=True):
+        """Cancel a running auto-lower. Sets the stop event (the walk thread
+        stops the motor and exits within a poll interval) and, when called from
+        another thread with wait=True, joins it -- so a manual jog issued during
+        a descent provably has the walk thread out of the way before it starts
+        commanding velocities of its own."""
+        self._walk_stop.set()
+        thread = self._walk_thread
+        if (wait and thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2)
+
+    def start_walk_lower(self):
+        """Lift only: start the Walking-mode sequence in the background --
+        lower until the motor current says the payload has grounded, then
+        hold rope tension at limited current (see _run_walk_lower). Requires
+        the lift to be homed (the soft down limit is the abort backstop and
+        is home-relative). Returns (ok, message)."""
+        if self.role != "lift":
+            return False, "auto-lower is lift-only"
+        if not self.homing_complete:
+            self.walk_status = None
+            self.last_error = ("walking: lift not homed -- home first (drive "
+                               "up into the top end stop), then re-select "
+                               "Walking mode")
+            return False, self.last_error
+        self._cancel_walk()               # serialise with a previous descent
+        self._walk_stop.clear()
+        self.walk_status = "lowering"
+        self.last_error = None
+        self._walk_thread = threading.Thread(
+            target=self._run_walk_lower, daemon=True)
+        self._walk_thread.start()
+        return True, "auto-lower started"
+
+    def rearm_walk(self):
+        """Operator re-arm (the 'Re-arm walk' button): re-run the Walking-mode
+        sequence after a fall catch, an abort, or a manual override -- e.g.
+        once the robot has recovered and is standing again. Refused while a
+        sequence phase is actively running (STOP is the take-over control
+        there) and outside Walking mode. start_walk_lower() re-checks homing
+        and cleans up any leftover state (2031h restore) itself."""
+        if self.role != "lift":
+            return False, "walk re-arm is lift-only"
+        if self.mode != MODE_WALKING:
+            return False, "walk re-arm only works in Walking mode"
+        if self.walk_status in ("lowering", "tensioning", "grounded"):
+            return False, (f"walk sequence is busy ({self.walk_status}) -- "
+                           "use STOP to take over first")
+        return self.start_walk_lower()
+
+    def _walk_abort(self, message):
+        """Stop the motion (brake closed) and surface why. Runs on the walk
+        thread; the 2031h restore is handled by _run_walk_lower's finally."""
+        self.stop_motor()
+        self.walk_status = "aborted"
+        self.last_error = f"walking: {message}"
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} walk "
+              f"sequence aborted: {message}")
+
+    def _walk_cancelled(self, expected_direction):
+        """True when the walk sequence must exit QUIETLY (no abort status):
+        cancelled via the stop event or a mode switch, or overridden
+        externally -- STOP and manual jog either disable the drive or change
+        jog_direction away from what this thread commanded."""
+        return (self._walk_stop.is_set() or self.mode != MODE_WALKING
+                or self.jog_direction != expected_direction
+                or not self.drive_enabled)
+
+    def _walk_exit_quietly(self, expected_direction):
+        """Handle a cancellation seen by _walk_cancelled: stop the motion only
+        if this thread's own command is still the active one (an external STOP
+        already stopped; a pending jog stops us first and then takes over)."""
+        if self.drive_enabled and self.jog_direction == expected_direction:
+            self.stop_motor()
+        self.walk_status = None
+
+    def _run_walk_lower(self):
+        """Walking mode: lower until touchdown, then hold rope tension.
+
+        Phase 1 -- LOWERING ("lowering"): drive down at walk_lower_speed
+        (plain Profile Velocity, the lift's configured ramp) watching a fresh
+        Actual Current (2039h:05h) read each WALK_POLL_INTERVAL_S. While the
+        payload hangs on the rope the motor carries its load; when it
+        grounds, the load transfers off the rope and |current| drops below
+        walk_touchdown_ma. The detector is armed only once |606Ch| has
+        reached WALK_ARM_VELOCITY_FRACTION of the commanded speed (the ramp's
+        current transients would false-trigger) and needs
+        WALK_TOUCHDOWN_SAMPLES consecutive below-threshold samples; the
+        threshold is re-read from params every iteration for live tuning.
+
+        Phase 2 -- TENSION ("tensioning"): on touchdown the drive STAYS in
+        Operation enabled / Profile Velocity -- no stop, brake stays open.
+        Max Motor Current (2031h) is lowered to walk_tension_ma, then the
+        target velocity is reversed to +walk_lower_speed: the
+        current-clamped motor reels in slack rope but stalls against the
+        grounded payload's weight, holding the rope at tension current.
+
+        Phase 3 -- ZERO CURRENT + FALL WATCH ("grounded" -> "caught"): once
+        the reel-in has stalled (|606Ch| at standstill for
+        WALK_STALL_SAMPLES, armed by upward motion or
+        WALK_TENSION_ARM_TIMEOUT_S), the target velocity is zeroed and
+        2031h is set to 0: no torque at all, mode and enable state
+        untouched. The thread then differentiates fresh 606Ch reads: the
+        torqueless drum follows the payload, so normal walking pays rope out
+        gently (negative, downwards) while a fall back-drives it with a
+        steep negative ramp. Acceleration <= -walk_catch_accel for
+        WALK_CATCH_SAMPLES consecutive pairs -> 2031h = walk_catch_ma: with
+        the target already at 0, the drive arrests the fall and HOLDS at
+        zero velocity until the operator takes over (STOP / joystick / mode
+        switch); the positive end stop / drive-state aborts stay armed.
+
+        The original 2031h value is read up front and restored in the finally
+        on EVERY exit after it was touched -- always after the motion has been
+        stopped or handed over, never while this thread's upward command is
+        still active (full current + commanded up-velocity would hoist the
+        payload). A 2031h reading 0 at start (a killed run left it there)
+        refuses to start: power-cycle the controller to get the saved value
+        back.
+
+        Aborts (stop, brake closed, 2031h restored): soft down limit / neg
+        end stop / WALK_LOWER_TIMEOUT_S during the descent; positive end stop
+        or the drive leaving Operation enabled during tension. Exits QUIETLY,
+        without re-stopping, when someone else took over (STOP / manual jog /
+        mode switch) -- see _walk_cancelled/_walk_exit_quietly."""
+        params = self.get_params()
+        speed = int(params.get("walk_lower_speed", 0))
+        if speed <= 0:
+            self._walk_abort("no descent speed configured")
+            return
+        if self._down_position_blocked():
+            self._walk_abort("already at the soft down limit")
+            return
+        original_ma = self._read_max_current()
+        if not original_ma:
+            self._walk_abort(
+                f"Max Motor Current (2031h) reads {original_ma!r} -- cannot "
+                "arm the tension phase; power-cycle the lift controller")
+            return
+        if not self._ensure_operation_enabled():
+            self._walk_abort(self.last_error or "could not enable drive")
+            return
+        if not self.set_target_velocity(-speed):
+            self._walk_abort(self.last_error or "could not set velocity")
+            return
+        self.jog_direction = -1
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} auto-lower: "
+              f"descending at {speed} rpm until touchdown")
+
+        current_modified = False
+        try:
+            # --- phase 1: lower until touchdown ---------------------------
+            armed = False
+            below = 0
+            deadline = time.monotonic() + WALK_LOWER_TIMEOUT_S
+            while below < WALK_TOUCHDOWN_SAMPLES:
+                if self._walk_cancelled(-1):
+                    self._walk_exit_quietly(-1)
+                    return
+                state = self.get_state()
+                if state.get("neg_limit"):
+                    self._walk_abort("negative end stop reached before "
+                                     "touchdown")
+                    return
+                if self._down_position_blocked(state.get("position_actual")):
+                    self._walk_abort("soft down limit reached before "
+                                     "touchdown -- check walk_touchdown_ma")
+                    return
+                if time.monotonic() >= deadline:
+                    self._walk_abort("timed out before touchdown")
+                    return
+
+                velocity = self._read_velocity_rpm()
+                if (not armed and velocity is not None
+                        and abs(velocity) >= WALK_ARM_VELOCITY_FRACTION * speed):
+                    armed = True
+                if armed:
+                    current = self._read_current()
+                    threshold = int(self.get_params().get("walk_touchdown_ma", 0))
+                    if current is not None and abs(current) < threshold:
+                        below += 1
+                    else:
+                        below = 0
+                    if below >= WALK_TOUCHDOWN_SAMPLES:
+                        break
+                self._walk_stop.wait(WALK_POLL_INTERVAL_S)
+
+            # --- phase 2: tension -- reel in slack at limited current -----
+            # Order matters: clamp 2031h BEFORE reversing the velocity, so
+            # the up-command can never run at full current.
+            tension_ma = int(self.get_params().get("walk_tension_ma", 0))
+            current_modified = True
+            if not self._set_max_current(tension_ma):
+                self._walk_abort("could not write tension current (2031h)")
+                return
+            if not self.set_target_velocity(speed):
+                self._walk_abort(self.last_error or "could not reverse to "
+                                 "tension velocity")
+                return
+            self.jog_direction = 1
+            self.walk_status = "tensioning"
+            self.last_error = None
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} walk: "
+                  f"touchdown -- tensioning up at {speed} rpm, 2031h clamped "
+                  f"to {tension_ma} mA (was {original_ma} mA)")
+
+            armed = False
+            still = 0
+            arm_deadline = time.monotonic() + WALK_TENSION_ARM_TIMEOUT_S
+            while still < WALK_STALL_SAMPLES:
+                if self._walk_cancelled(1):
+                    self._walk_exit_quietly(1)
+                    return
+                state = self.get_state()
+                if state.get("pos_limit"):
+                    self._walk_abort("positive end stop during tension -- "
+                                     "payload no longer on the rope?")
+                    return
+                status_word = state.get("status_word")
+                if status_word is not None and not _operation_enabled(status_word):
+                    self._walk_abort("drive left Operation enabled during "
+                                     "tension "
+                                     f"({_decode_cia402_state(status_word)})")
+                    return
+
+                velocity = self._read_velocity_rpm()
+                if (not armed
+                        and ((velocity is not None
+                              and velocity > VELOCITY_ZERO_RPM)
+                             or time.monotonic() >= arm_deadline)):
+                    armed = True
+                if (armed and velocity is not None
+                        and abs(velocity) <= VELOCITY_ZERO_RPM):
+                    still += 1
+                else:
+                    still = 0
+                if still >= WALK_STALL_SAMPLES:
+                    break
+                self._walk_stop.wait(WALK_POLL_INTERVAL_S)
+
+            # --- phase 3: stalled taut -- zero current + fall watch --------
+            # Zero the velocity command along with the current: the drive
+            # stays in Operation enabled, but when the fall catch restores
+            # torque, the target is already 0 -- it arrests the fall and
+            # HOLDS instead of reeling up at the tension phase's up-command.
+            if not self.set_target_velocity(0):
+                self._walk_abort(self.last_error or "could not zero the "
+                                 "velocity command after stall")
+                return
+            if not self._set_max_current(0):
+                self._walk_abort("could not zero 2031h after stall")
+                return
+            self.walk_status = "grounded"
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} walk: "
+                  f"rope taut (stalled) -- 2031h = 0 mA, target velocity 0, "
+                  f"Operation enabled kept; fall watch armed")
+
+            # Differentiate consecutive fresh 606Ch reads. The torqueless
+            # drum follows the payload: gentle negative pay-out is the robot
+            # walking; acceleration at or below -walk_catch_accel for
+            # WALK_CATCH_SAMPLES consecutive pairs is a fall. A failed read
+            # skips the pair (neither counts nor resets).
+            last_velocity = None
+            last_time = None
+            rapid = 0
+            while rapid < WALK_CATCH_SAMPLES:
+                if self._walk_cancelled(1):
+                    self._walk_exit_quietly(1)
+                    return
+                status_word = self.get_state().get("status_word")
+                if status_word is not None and not _operation_enabled(status_word):
+                    self._walk_abort("drive left Operation enabled while "
+                                     "grounded "
+                                     f"({_decode_cia402_state(status_word)})")
+                    return
+                velocity = self._read_velocity_rpm()
+                now = time.monotonic()
+                if velocity is not None:
+                    if last_velocity is not None and now > last_time:
+                        accel = (velocity - last_velocity) / (now - last_time)
+                        catch_accel = int(self.get_params().get("walk_catch_accel", 0))
+                        if catch_accel > 0 and accel <= -catch_accel:
+                            rapid += 1
+                        else:
+                            rapid = 0
+                    last_velocity, last_time = velocity, now
+                if rapid >= WALK_CATCH_SAMPLES:
+                    break
+                self._walk_stop.wait(WALK_POLL_INTERVAL_S)
+
+            # --- fall caught: torque back on ------------------------------
+            catch_ma = int(self.get_params().get("walk_catch_ma", 0))
+            if not self._set_max_current(catch_ma):
+                self._walk_abort("FALL DETECTED but could not write catch "
+                                 "current (2031h)!")
+                return
+            self.walk_status = "caught"
+            self.last_error = (f"walking: fall caught -- 2031h = {catch_ma} "
+                               "mA; arrested to zero velocity, holding. "
+                               "STOP / joystick to take over")
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} walk: "
+                  f"FALL CAUGHT (drum accel <= "
+                  f"-{self.get_params().get('walk_catch_accel')} rpm/s for "
+                  f"{WALK_CATCH_SAMPLES} samples) -- 2031h = {catch_ma} mA")
+            while True:
+                if self._walk_cancelled(1):
+                    self._walk_exit_quietly(1)
+                    return
+                state = self.get_state()
+                if state.get("pos_limit"):
+                    self._walk_abort("positive end stop after fall catch")
+                    return
+                status_word = state.get("status_word")
+                if status_word is not None and not _operation_enabled(status_word):
+                    self._walk_abort("drive left Operation enabled after "
+                                     "fall catch "
+                                     f"({_decode_cia402_state(status_word)})")
+                    return
+                self._walk_stop.wait(WALK_POLL_INTERVAL_S)
+        finally:
+            # Always leave the drive with its real current limit -- but only
+            # once motion is stopped / handed over (every path above stops or
+            # yields before reaching here).
+            if current_modified:
+                if self._set_max_current(original_ma):
+                    print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} "
+                          f"walk: restored Max Motor Current (2031h) to "
+                          f"{original_ma} mA")
+                else:
+                    self.last_error = (f"walking: FAILED to restore 2031h to "
+                                       f"{original_ma} mA -- lift torque is "
+                                       "limited; power-cycle the controller")
+                    print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} "
+                          f"walk: {self.last_error}")
 
     def _log_state_change(self, status_word):
         """Print a line to the terminal whenever this controller's CiA 402 state
@@ -1003,6 +1519,8 @@ class RailController:
 
     def _read_velocity_rpm(self):
         """Velocity actual value (606Ch) in rpm, signed; None on read error."""
+        if self._simulate:
+            return int(self._sim_velocity)
         raw = self._read(OD_VELOCITY_ACTUAL)
         return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
 
@@ -1029,6 +1547,10 @@ class RailController:
         one the automatic brake control releases the brake on (manual 7.3.3) --
         instead of a multi-step walk interleaving with the still-running brake
         close sequence."""
+        # A STOP overrides a running auto-lower: flag it so the walk thread
+        # exits instead of re-commanding its descent velocity. No join here --
+        # the walk thread itself calls stop_motor() on touchdown/abort.
+        self._walk_stop.set()
         self.jog_direction = 0
         if self._simulate:
             self._sim_target_velocity = 0.0
@@ -1104,6 +1626,10 @@ class RailController:
             return self.jog_stop()
         if self.pid_running:
             return False, "stop the PID loop before jogging"
+        # Manual drive overrides a running Walking-mode auto-lower; the join
+        # inside guarantees the walk thread has stopped commanding velocities
+        # before this one starts.
+        self._cancel_walk()
         if self._down_locked(direction):
             return False, self.last_error
         if direction < 0 and self._down_position_blocked():
@@ -1149,6 +1675,8 @@ class RailController:
             return False, f"invalid velocity {velocity!r}"
         if self.pid_running:
             return False, "stop the PID loop before jogging"
+        # Manual drive overrides a running Walking-mode auto-lower (see jog()).
+        self._cancel_walk()
 
         # Clamp magnitude to the full-scale joy speed so the stick can never
         # command more than the configured maximum.
@@ -1591,8 +2119,39 @@ class RailController:
         dt = min(now - self._sim_last, 0.5)
         self._sim_last = now
 
-        # First-order velocity ramp toward the commanded target.
-        self._sim_velocity += (self._sim_target_velocity - self._sim_velocity) * min(1.0, dt * 5)
+        # Lift only: current-limit physics for the Walking tension phase.
+        # With 2031h clamped below what lifting the payload "needs", the
+        # velocity servo loses: upward motion reels in slack until the
+        # taut-rope position (the fake ground) and stalls there; with the
+        # limit at 0 the drum produces no torque and stands still; a
+        # simulated fall (POST /api/lift/sim_fall) has gravity back-drive
+        # the under-torqued drum. In all three cases the servo ramp below
+        # must NOT apply -- a torque-starved drive cannot pull toward its
+        # velocity target. Decided BEFORE integrating position, so a
+        # stalled/torqueless drum cannot creep.
+        servo_overridden = False
+        if (self.role == "lift" and self._sim_current_limit is not None
+                and self._sim_current_limit < SIM_LIFT_HOLD_CURRENT_MA):
+            if self._sim_falling:
+                self._sim_velocity -= SIM_FALL_ACCEL_RPM_S * dt
+                servo_overridden = True
+            elif self._sim_current_limit <= 0:
+                self._sim_velocity = 0.0
+                servo_overridden = True
+            elif (self._sim_velocity >= 0
+                    and self._sim_position >= SIM_GROUND_POSITION):
+                self._sim_position = SIM_GROUND_POSITION
+                self._sim_velocity = 0.0
+                servo_overridden = True
+        else:
+            # Full current available again (catch / restore): the velocity
+            # loop is back in charge, the fall is over.
+            self._sim_falling = False
+
+        # First-order velocity ramp toward the commanded target -- only while
+        # the drive actually has the current to pursue it.
+        if not servo_overridden:
+            self._sim_velocity += (self._sim_target_velocity - self._sim_velocity) * min(1.0, dt * 5)
 
         # Integrate velocity into a fake position actual value (6064h).
         self._sim_position += self._sim_velocity * dt
@@ -1618,8 +2177,9 @@ class RailController:
             "control_word": 0x000F if self.drive_enabled else 0x0006,
             "digital_inputs": 0,
             "digital_outputs": digital_outputs,
-            # Actual Current (2039h:05h) in mA; roughly proportional to velocity.
-            "motor_current": int(self._sim_velocity * 2.0),
+            # Actual Current (2039h:05h) in mA; roughly proportional to
+            # velocity, collapsing below the fake ground (see _sim_current).
+            "motor_current": self._sim_current(),
             "neg_limit": False,
             "pos_limit": False,
         }
@@ -1893,6 +2453,10 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     POST /api/<name>/enable
     POST /api/<name>/pid         -> {action: "start"|"stop"}
     POST /api/<name>/lift        -> {direction: "up"|"down"|"stop"}  (lift only)
+    POST /api/lift/walk_rearm    -> re-run the Walking-mode sequence after a
+                                     fall catch / abort (Walking mode only)
+    POST /api/lift/sim_fall      -> start a fake fall (simulate mode only;
+                                     tests the Walking-mode fall catch)
     POST /api/system/mode        -> {mode: "basic"|"walking"} switches the
                                      system-wide operating mode
     POST /api/settings/save      -> writes current params of all controllers
@@ -1929,6 +2493,11 @@ class RailRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", _STATIC_TYPES.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
+        # Without cache headers, browsers apply HEURISTIC caching and a plain
+        # reload can keep serving a stale index.html/app.js for hours -- UI
+        # changes then silently don't arrive. The files are tiny and served
+        # over the local network, so just always fetch them fresh.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1954,6 +2523,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "homing_in_progress": ctrl.homing_in_progress,
                 "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
+                "walk_status": ctrl.walk_status,
                 "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
                 "pid_length_scale": (round(ctrl._rope_length_scale(), 3)
                                      if ctrl.role == "cart" else None),
@@ -2062,6 +2632,16 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             if direction == "down":
                 return ctrl.lift_down()
             return ctrl.jog_stop()
+        if action == "walk_rearm":
+            return ctrl.rearm_walk()
+        if action == "sim_fall":
+            # Test hook for the Walking-mode fall catch: gravity starts
+            # back-driving the fake drum (see _simulate_state). No effect on
+            # real hardware -- simulate mode only.
+            if not self.manager.simulate or ctrl.role != "lift":
+                return False, "sim_fall is simulate-mode, lift-only"
+            ctrl._sim_falling = True
+            return True, "simulated fall started"
         return False, f"unknown action '{action}'"
 
 

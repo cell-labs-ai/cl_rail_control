@@ -330,6 +330,27 @@ main {
 }
 .estop:active { filter: brightness(1.1); transform: scale(0.99); }
 
+/* Walking-mode re-arm (lift only). Visible whenever Walking mode is active;
+   disabled (grayed) while a walk sequence phase is running. */
+.walk-rearm {
+  width: 100%;
+  margin-top: 0.6rem;
+  border: 1px solid var(--status-info);
+  background: transparent;
+  color: var(--status-info);
+  border-radius: var(--radius-sm);
+  padding: 0.625rem 0.5rem;
+  font-size: 0.875rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background-color 0.15s ease, opacity 0.15s ease;
+}
+.walk-rearm:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--status-info) 12%, transparent);
+}
+.walk-rearm:disabled { opacity: 0.35; cursor: default; }
+
 /* Parameter rows */
 .param-row {
   display: grid;

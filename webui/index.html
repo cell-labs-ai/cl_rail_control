@@ -44,6 +44,7 @@
           <span class="flag flag-drive">idle</span>
           <span class="flag flag-pid">pid off</span>
           <span class="flag flag-homing">homing?</span>
+          <span class="flag flag-walk" hidden>walk</span>
           <span class="flag flag-down-limit">down limit set</span>
           <span class="flag flag-neg-limit">neg endstop</span>
           <span class="flag flag-pos-limit">pos endstop</span>
@@ -56,6 +57,10 @@
           <h3>Manual drive</h3>
           <div class="joy-mount"></div>
           <button class="estop">STOP</button>
+          <!-- Lift only: visible in Walking mode; grayed while the walk
+               sequence is running, enabled to restart it after a fall catch
+               / abort / manual override. -->
+          <button class="walk-rearm" hidden>⟳ Re-arm walk</button>
         </div>
 
         <!-- PID tuning -->

@@ -40,6 +40,11 @@ const modeSwitchEl = document.getElementById("mode-switch");
 // shows up here with no changes.
 const modeButtons = {};
 
+// Latest known system-wide operating mode; kept current by
+// updateModeSwitch() (config load, mode posts, every poll). Panels read it,
+// e.g. to show the lift's walk re-arm button only in Walking mode.
+let currentMode = null;
+
 function buildModeSwitch(modes) {
   for (const mode of modes) {
     const btn = document.createElement("button");
@@ -53,6 +58,7 @@ function buildModeSwitch(modes) {
 }
 
 function updateModeSwitch(mode) {
+  currentMode = mode;
   for (const [key, btn] of Object.entries(modeButtons)) {
     btn.classList.toggle("active", key === mode);
   }
@@ -378,10 +384,11 @@ function buildPanel(ctrl) {
     root.querySelector(".flag-pid").remove();
   }
 
-  // Homing status is a lift-only concern (checked once at connect); the cart
-  // has no homing, so drop its flag.
+  // Homing status and the Walking-mode auto-lower are lift-only concerns;
+  // the cart has neither, so drop their flags.
   if (ctrl.role !== "lift") {
     root.querySelector(".flag-homing").remove();
+    root.querySelector(".flag-walk").remove();
   }
 
   // Soft lower travel limit (LIFT_DOWN_POSITION_LIMIT) is lift-only and only
@@ -430,6 +437,17 @@ function buildPanel(ctrl) {
 
   root.querySelector(".estop").addEventListener("click", () => post(name, "stop", {}));
 
+  // Walking-mode re-arm (lift only): restart the walk sequence once the
+  // robot has recovered. Kept visible (but disabled) throughout Walking mode
+  // so the operator knows the option exists; hidden entirely in Basic.
+  let walkRearm = root.querySelector(".walk-rearm");
+  if (ctrl.role !== "lift") {
+    walkRearm.remove();
+    walkRearm = null;
+  } else {
+    walkRearm.addEventListener("click", () => post(name, "walk_rearm", {}));
+  }
+
   const pidToggle = root.querySelector(".pid-toggle");   // null when there is no PID card
   if (pidToggle) {
     pidToggle.addEventListener("click", () => {
@@ -458,6 +476,7 @@ function buildPanel(ctrl) {
   const flagDrive = root.querySelector(".flag-drive");
   const flagPid = root.querySelector(".flag-pid");
   const flagHoming = root.querySelector(".flag-homing");
+  const flagWalk = root.querySelector(".flag-walk");
   const flagDownLimit = hasDownLimit ? root.querySelector(".flag-down-limit") : null;
   const flagNegLimit = root.querySelector(".flag-neg-limit");
   const flagPosLimit = root.querySelector(".flag-pos-limit");
@@ -465,6 +484,13 @@ function buildPanel(ctrl) {
   lockFlagWidth(flagDrive, ["driving +", "driving -", "enabled", "idle"]);
   lockFlagWidth(flagPid, ["PID on", "PID off"]);
   lockFlagWidth(flagHoming, ["homed", "homing…", "not homed ↑", "homing ?"]);
+  if (flagWalk) {
+    // Starts hidden (only shown while the Walking-mode sequence is active);
+    // unhide briefly so lockFlagWidth measures real widths.
+    flagWalk.hidden = false;
+    lockFlagWidth(flagWalk, ["lowering ▼", "tension ▲", "grounded", "CAUGHT", "walk failed"]);
+    flagWalk.hidden = true;
+  }
   lockFlagWidth(flagDownLimit, ["down limit set", "AT DOWN LIMIT"]);
   lockFlagWidth(flagNegLimit, ["neg endstop", "NEG ENDSTOP"]);
   lockFlagWidth(flagPosLimit, ["pos endstop", "POS ENDSTOP"]);
@@ -483,11 +509,13 @@ function buildPanel(ctrl) {
       drive: flagDrive,
       pid: flagPid,
       homing: flagHoming,
+      walk: flagWalk,
       downLimit: flagDownLimit,
       negLimit: flagNegLimit,
       posLimit: flagPosLimit,
     },
     pidToggle,
+    walkRearm,
     errLine: root.querySelector(".err-line"),
   };
 }
@@ -583,6 +611,40 @@ function updatePanel(name, data) {
     p.flags.homing.classList.toggle("on-conn", homed);
     p.flags.homing.classList.toggle("on-pid", !homed && !!data.homing_in_progress);
     p.flags.homing.classList.toggle("on-limit", data.homing_complete === false && !data.homing_in_progress);
+  }
+
+  // Walking-mode sequence status (lift only). Hidden while inactive;
+  // "lowering ▼" during the descent, "tension ▲" while reeling in slack at
+  // limited current after touchdown, "grounded" once stalled taut with the
+  // current zeroed (fall watch armed), "CAUGHT" after the fall catch has
+  // restored torque, "walk failed" on an abort (reason in the error line).
+  if (p.flags.walk) {
+    const ws = data.walk_status;
+    p.flags.walk.hidden = !ws;
+    if (ws === "lowering") {
+      p.flags.walk.textContent = "lowering ▼";
+    } else if (ws === "tensioning") {
+      p.flags.walk.textContent = "tension ▲";
+    } else if (ws === "grounded") {
+      p.flags.walk.textContent = "grounded";
+    } else if (ws === "caught") {
+      p.flags.walk.textContent = "CAUGHT";
+    } else if (ws) {
+      p.flags.walk.textContent = "walk failed";
+    }
+    p.flags.walk.classList.toggle("on-pid", ws === "lowering");
+    p.flags.walk.classList.toggle("on-drive", ws === "tensioning");
+    p.flags.walk.classList.toggle("on-conn", ws === "grounded");
+    p.flags.walk.classList.toggle("on-limit", ws === "aborted" || ws === "caught");
+  }
+
+  // Walk re-arm button (lift only): visible throughout Walking mode so the
+  // option is discoverable, but only clickable when no sequence phase is
+  // actively running (caught / aborted / idle after an override).
+  if (p.walkRearm) {
+    const busy = ["lowering", "tensioning", "grounded"].includes(data.walk_status);
+    p.walkRearm.hidden = currentMode !== "walking";
+    p.walkRearm.disabled = busy;
   }
 
   // Soft lower travel limit (lift only, only present when LIFT_DOWN_POSITION_LIMIT
