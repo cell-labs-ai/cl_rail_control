@@ -411,6 +411,9 @@ PID_PARAM_SPECS = [
      "default": 15, "min": 0, "max": 200, "step": 1, "software": True},
     {"key": "max_speed", "label": "PID max speed (rpm)", "kind": "slider", "group": "pid",
      "default": 600, "min": 0, "max": 800, "step": 10, "software": True},
+    {"key": "length_comp", "label": "Rope-length compensation", "kind": "select", "group": "pid",
+     "default": 1, "options": [{"value": 1, "label": "On"}, {"value": 0, "label": "Off"}],
+     "software": True},
     {"key": "pid_accel", "label": "PID acceleration", "kind": "number", "group": "pid",
      "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
     {"key": "pid_jerk", "label": "PID jerk", "kind": "number", "group": "pid",
@@ -433,6 +436,34 @@ PID_INTEGRAL_LIMIT = 200
 PID_INTEGRAL_LEAK_RATE = 0.1
 PID_INTERVAL_S = 0.01          # 100 Hz (motion_test.py runs 50 Hz)
 PID_MAX_DT_S = 5 * PID_INTERVAL_S
+
+# Rope-length scaling of the PID error (cart only, toggled by the length_comp
+# param). The analog input measures the rope ANGLE, but what the cart actually
+# has to null is the robot's horizontal offset ~ rope_length * sin(angle): the
+# same angle error is a much larger offset with 3 m of rope paid out than with
+# 1 m. Scaling the (deadzoned) error and the derivative by the current rope
+# length keeps one set of gains consistent across payout lengths instead of
+# going sluggish near the top and twitchy near the bottom.
+#
+# Rope length comes from the lift's spindle position (6064h): homed at the top
+# end stop = 0 counts, paying out drives it negative (see
+# LIFT_DOWN_POSITION_LIMIT), so payout = -position. Both constants below are in
+# those same counts and are set to match the rig, like the down limit:
+#
+#   PID_ROPE_COUNTS_AT_TOP -- rope already out (spindle to hook) with the lift
+#       parked at home. Measure once: rope length at top / rope per count.
+#   PID_ROPE_REF_PAYOUT    -- the payout at which the current gains were
+#       tuned; the scale is exactly 1.0 there, so existing tuning carries
+#       over unchanged at that height.
+#
+# The scale is clamped to [PID_LENGTH_SCALE_MIN, PID_LENGTH_SCALE_MAX] so a bad
+# lift reading can neither kill the loop gain nor blow it up, and it falls back
+# to 1.0 (the unscaled loop) whenever no trustworthy payout is available --
+# lift missing, not connected, or not homed (see _rope_length_scale).
+PID_ROPE_COUNTS_AT_TOP = 30000
+PID_ROPE_REF_PAYOUT = 60000
+PID_LENGTH_SCALE_MIN = 0.3
+PID_LENGTH_SCALE_MAX = 3.0
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +510,12 @@ class RailController:
         self._state_lock = threading.Lock()
         self._last_analog = None
         self._last_state_name = None        # CiA 402 state, for change logging
+
+        # Cart only: the lift controller, wired in by
+        # ControllerManager after both are up, so the PID loop can scale its
+        # gains by the rope payout (see _rope_length_scale). None on the lift
+        # itself / while the lift is missing -- the scale then stays 1.0.
+        self.length_source = None
 
         # System-wide operating mode, pushed onto every controller by
         # ControllerManager.set_mode(). Gates mode-specific behaviour (for
@@ -1430,6 +1467,26 @@ class RailController:
         self.set_target_velocity(0)
         return True, "ok"
 
+    def _rope_length_scale(self):
+        """Gain scale from the current rope payout (see PID_ROPE_COUNTS_AT_TOP).
+
+        Reads the lift's cached snapshot (10 Hz poller) rather than the bus:
+        rope length changes slowly, so staleness is harmless and the 100 Hz
+        PID loop adds no bus traffic. Falls back to 1.0 -- the unscaled
+        loop -- whenever a trustworthy payout is not available: no lift wired
+        in, lift not connected, not homed (6064h has no reference then), or
+        no position read yet."""
+        lift = self.length_source
+        if lift is None or not lift.connected or lift.homing_complete is not True:
+            return 1.0
+        position = lift.get_state().get("position_actual")
+        if position is None:
+            return 1.0
+        payout = max(0, -position)
+        scale = ((PID_ROPE_COUNTS_AT_TOP + payout)
+                 / (PID_ROPE_COUNTS_AT_TOP + PID_ROPE_REF_PAYOUT))
+        return max(PID_LENGTH_SCALE_MIN, min(PID_LENGTH_SCALE_MAX, scale))
+
     def run_pid_loop(self):
         """Direct velocity PID on the analog angle -> hold it at PID_SETPOINT.
 
@@ -1438,6 +1495,14 @@ class RailController:
         output clamped to +/- max_speed. The gains are read live from params
         every iteration, so the UI retunes it on the fly; the setpoint is
         fixed (PID_SETPOINT) and no longer part of the UI.
+
+        With length_comp on, the deadzoned error and the derivative are both
+        multiplied by the rope-length scale (_rope_length_scale), converting
+        the angle terms into horizontal-offset terms up to a constant: the
+        deeper the robot hangs, the stronger the correction for the same
+        angle. Scaling both P/I and D by the same factor keeps the damping
+        ratio of the tuning intact. The deadzone stays in raw digits -- it is
+        a sensor-noise band, not a physical distance.
 
         The angle is read fresh from the bus every iteration (_read_angle):
         the poller snapshot only updates at 10 Hz, and feeding that to a
@@ -1474,6 +1539,8 @@ class RailController:
                 error = PID_SETPOINT - angle
                 if abs(error) <= p["deadzone"]:
                     error = 0
+                scale = self._rope_length_scale() if p["length_comp"] else 1.0
+                error *= scale
 
                 if last_angle is not None and last_time is not None:
                     dt = min(now - last_time, PID_MAX_DT_S)
@@ -1492,7 +1559,7 @@ class RailController:
 
                 velocity = (p["kp"] * error
                             + p["ki"] * integral
-                            + p["kd"] * filtered_rate)
+                            + p["kd"] * filtered_rate * scale)
                 velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
                 if state.get("pos_limit") and velocity > 0:
                     velocity = 0
@@ -1620,6 +1687,7 @@ class ControllerManager:
                     ctrl.check_homing()
                 ctrl.start()
                 self.controllers[name] = ctrl
+            self._wire_length_source()
             return
 
         if Nanolib is None:
@@ -1710,6 +1778,16 @@ class ControllerManager:
         for name, suffix, _role in self.TARGETS:
             if name not in self.controllers:
                 print(f"WARNING: {name} controller (serial ...{suffix}) not found.")
+        self._wire_length_source()
+
+    def _wire_length_source(self):
+        """Point the cart at the lift for rope-length gain scaling (see
+        RailController._rope_length_scale). Harmless when either controller is
+        missing: the cart's length_source stays/becomes None and the PID scale
+        falls back to 1.0."""
+        cart = self.controllers.get("cart")
+        if cart is not None:
+            cart.length_source = self.controllers.get("lift")
 
     def _discover_modbus_tcp_buses(self):
         result = self._accessor.listAvailableBusHardware()
@@ -1877,6 +1955,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
                 "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
+                "pid_length_scale": (round(ctrl._rope_length_scale(), 3)
+                                     if ctrl.role == "cart" else None),
                 "state": state,
                 "params": ctrl.get_params(),
             }
