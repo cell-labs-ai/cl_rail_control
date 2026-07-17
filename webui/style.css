@@ -300,7 +300,6 @@ main {
   touch-action: none;
 }
 .estop:active { filter: brightness(1.1); transform: scale(0.99); }
-.hint { margin: 0.5rem 0 0; font-size: 0.75rem; color: var(--text-muted); }
 
 /* Parameter rows */
 .param-row {
