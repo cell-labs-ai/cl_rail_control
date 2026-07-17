@@ -77,6 +77,36 @@ except Exception as exc:  # pragma: no cover - depends on platform
 CART_SERIAL_SUFFIX = "0168"   # cart on the rail (already used in motion_test.py)
 LIFT_SERIAL_SUFFIX = "0173"   # payload lift (template)
 
+# ---------------------------------------------------------------------------
+# Operating modes
+# ---------------------------------------------------------------------------
+#
+# One system-wide operating mode, switched from the UI topbar and applied to
+# every controller. Adding a mode is a data change here plus whatever
+# behaviour it gates (grep for self.mode in RailController).
+#
+#   * basic   -- everything works as before, with one addition: the LIFT
+#                auto-stops (same as the STOP button: drive disabled, brake
+#                closed) after LIFT_IDLE_STOP_TIMEOUT_S of no up or down
+#                movement, so the load never hangs on motor current alone
+#                for long. See _maybe_idle_stop().
+#   * walking -- behaviour to be defined; currently identical to basic minus
+#                the lift idle auto-stop.
+
+MODE_BASIC = "basic"
+MODE_WALKING = "walking"
+OPERATING_MODES = [
+    {"key": MODE_BASIC, "label": "Basic"},
+    {"key": MODE_WALKING, "label": "Walking"},
+]
+DEFAULT_MODE = MODE_BASIC
+
+# Basic mode, lift only: with the drive enabled but no up/down movement --
+# neither commanded (jog_direction) nor actual (|606Ch| above the standstill
+# threshold) -- for this long, stop the motor like the STOP button does
+# (stop_motor: ramp to zero, drop out of Operation enabled, brake closes).
+LIFT_IDLE_STOP_TIMEOUT_S = 10.0
+
 # Poll rate for the live readout shown in the UI. Slower than motion_test.py's
 # 50 Hz control poll -- this only feeds a browser display and shares the bus
 # lock with the control writes, so 10 Hz keeps the UI responsive without
@@ -450,6 +480,14 @@ class RailController:
         self._last_analog = None
         self._last_state_name = None        # CiA 402 state, for change logging
 
+        # System-wide operating mode, pushed onto every controller by
+        # ControllerManager.set_mode(). Gates mode-specific behaviour (for
+        # now: the lift's Basic-mode idle auto-stop).
+        self.mode = DEFAULT_MODE
+        # Monotonic time since when the lift has been enabled but motionless
+        # (see _maybe_idle_stop); None while moving / not applicable.
+        self._idle_since = None
+
         # Drive / status flags surfaced to the UI.
         self.drive_enabled = False          # Profile Velocity mode + operation enabled
         self.jog_direction = 0              # -1, 0, +1
@@ -622,7 +660,44 @@ class RailController:
             self._log_state_change(snapshot.get("status_word"))
             self._maybe_home_at_endstop(snapshot)
             self._enforce_down_limit(snapshot)
+            self._maybe_idle_stop(snapshot)
             self._stop_event.wait(STATE_POLL_INTERVAL_S)
+
+    def set_mode(self, mode):
+        """Apply the system-wide operating mode to this controller. The idle
+        timer restarts so a mode switch always grants a fresh
+        LIFT_IDLE_STOP_TIMEOUT_S window."""
+        self.mode = mode
+        self._idle_since = None
+
+    def _maybe_idle_stop(self, snapshot):
+        """Basic mode, lift only: stop the drive like the STOP button does
+        (brake closed) after LIFT_IDLE_STOP_TIMEOUT_S with no up or down
+        movement. 'Movement' is either a commanded jog direction or an actual
+        velocity (606Ch) above the standstill threshold, so a held joystick
+        that is stalled against a limit still counts as active.
+
+        Only armed while the drive is enabled (brake open, load held on motor
+        current) -- an already-stopped lift has nothing to stop -- and never
+        during homing, whose enable must not be yanked away mid-procedure."""
+        if (self.role != "lift" or self.mode != MODE_BASIC
+                or not self.drive_enabled or self.homing_in_progress):
+            self._idle_since = None
+            return
+        velocity = snapshot.get("velocity_actual")
+        moving = (self.jog_direction != 0
+                  or (velocity is not None and abs(velocity) > VELOCITY_ZERO_RPM))
+        now = time.monotonic()
+        if moving or self._idle_since is None:
+            self._idle_since = now
+            return
+        if now - self._idle_since < LIFT_IDLE_STOP_TIMEOUT_S:
+            return
+        self._idle_since = None
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: no movement "
+              f"for {LIFT_IDLE_STOP_TIMEOUT_S:.0f}s in Basic mode -- "
+              f"auto-stop (brake closed)")
+        self.stop_motor()
 
     def _log_state_change(self, status_word):
         """Print a line to the terminal whenever this controller's CiA 402 state
@@ -1517,6 +1592,20 @@ class ControllerManager:
         self._bus_id = None
         self._bus_lock = threading.RLock()
         self.controllers = {}   # name -> RailController
+        self.mode = DEFAULT_MODE
+
+    def set_mode(self, mode):
+        """Switch the system-wide operating mode (see OPERATING_MODES) and push
+        it onto every controller. Returns (ok, message)."""
+        if mode not in {m["key"] for m in OPERATING_MODES}:
+            return False, f"unknown mode {mode!r}"
+        if mode != self.mode:
+            print(f"[{time.strftime('%H:%M:%S')}] operating mode: "
+                  f"{self.mode} -> {mode}")
+        self.mode = mode
+        for ctrl in self.controllers.values():
+            ctrl.set_mode(mode)
+        return True, f"mode set to {mode}"
 
     def connect(self):
         if self.simulate:
@@ -1726,6 +1815,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     POST /api/<name>/enable
     POST /api/<name>/pid         -> {action: "start"|"stop"}
     POST /api/<name>/lift        -> {direction: "up"|"down"|"stop"}  (lift only)
+    POST /api/system/mode        -> {mode: "basic"|"walking"} switches the
+                                     system-wide operating mode
     POST /api/settings/save      -> writes current params of all controllers
                                      to config/settings.json
     POST /api/settings/load      -> re-reads config/settings.json and applies
@@ -1814,10 +1905,13 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                     }
                     for name, ctrl in self.manager.controllers.items()
                 ],
+                "modes": OPERATING_MODES,
+                "mode": self.manager.mode,
                 "simulate": self.manager.simulate,
             })
         if path == "/api/state":
-            return self._send_json({"controllers": self._snapshot()})
+            return self._send_json({"mode": self.manager.mode,
+                                    "controllers": self._snapshot()})
         if path.startswith("/api/"):
             return self.send_error(404, "Unknown API endpoint")
         # Static asset (style.css, app.js, ...).
@@ -1829,6 +1923,15 @@ class RailRequestHandler(BaseHTTPRequestHandler):
         if len(parts) != 3 or parts[0] != "api":
             return self.send_error(404, "Unknown API endpoint")
         _api, name, action = parts
+
+        if name == "system":
+            if action == "mode":
+                ok, message = self.manager.set_mode(self._read_body().get("mode"))
+            else:
+                ok, message = False, f"unknown system action '{action}'"
+            return self._send_json({"ok": ok, "message": message,
+                                    "mode": self.manager.mode},
+                                   200 if ok else 400)
 
         if name == "settings":
             if action == "save":

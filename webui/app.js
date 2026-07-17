@@ -32,6 +32,45 @@ const JOY_SEND_INTERVAL_MS = 80;
 const panelsEl = document.getElementById("panels");
 const linkBadge = document.getElementById("link-badge");
 const modeBadge = document.getElementById("mode-badge");
+const modeSwitchEl = document.getElementById("mode-switch");
+
+// --- operating-mode switcher ------------------------------------------------
+
+// key -> button, built from /api/config (modes) so a mode added server-side
+// shows up here with no changes.
+const modeButtons = {};
+
+function buildModeSwitch(modes) {
+  for (const mode of modes) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "mode-btn";
+    btn.textContent = mode.label;
+    btn.addEventListener("click", () => setOperatingMode(mode.key));
+    modeSwitchEl.appendChild(btn);
+    modeButtons[mode.key] = btn;
+  }
+}
+
+function updateModeSwitch(mode) {
+  for (const [key, btn] of Object.entries(modeButtons)) {
+    btn.classList.toggle("active", key === mode);
+  }
+}
+
+async function setOperatingMode(mode) {
+  try {
+    const res = await api("/api/system/mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (res.mode) updateModeSwitch(res.mode);
+    if (!res.ok) flashSettingsStatus(false, res.message || "mode switch failed");
+  } catch (err) {
+    flashSettingsStatus(false, String(err));
+  }
+}
 
 // --- theme toggle ----------------------------------------------------------
 
@@ -607,6 +646,7 @@ async function poll() {
     const data = await api("/api/state");
     linkBadge.textContent = "connected";
     linkBadge.className = "badge live";
+    updateModeSwitch(data.mode);
     for (const [name, cdata] of Object.entries(data.controllers)) {
       updatePanel(name, cdata);
     }
@@ -622,6 +662,8 @@ async function init() {
   config = await api("/api/config");
   modeBadge.textContent = config.simulate ? "SIMULATION" : "LIVE";
   modeBadge.className = "badge " + (config.simulate ? "sim" : "live");
+  buildModeSwitch(config.modes || []);
+  updateModeSwitch(config.mode);
 
   if (!config.controllers.length) {
     panelsEl.innerHTML = "<p style='color:var(--muted)'>No controllers connected.</p>";

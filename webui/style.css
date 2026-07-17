@@ -103,6 +103,35 @@ body {
 .badge.down { color: var(--status-error); border-color: var(--status-error); }
 .badge.sim  { color: var(--status-warn); border-color: var(--status-warn); }
 
+/* Operating-mode switcher: a segmented pill of one button per mode. */
+.mode-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+.mode-btn {
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 0.2rem 0.75rem;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.mode-btn:hover { color: var(--text); }
+.mode-btn.active {
+  background: var(--card-bg);
+  color: var(--brand);
+  box-shadow: var(--shadow);
+  font-weight: 600;
+}
+
 /* Round button (used for the theme toggle) */
 .btn-round {
   display: inline-flex;
