@@ -417,7 +417,7 @@ PID_PARAM_SPECS = [
     {"key": "pid_accel", "label": "PID acceleration", "kind": "number", "group": "pid",
      "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
     {"key": "pid_jerk", "label": "PID jerk", "kind": "number", "group": "pid",
-     "default": 18000, "min": 0, "max": 200000, "step": 100, "software": True},
+     "default": 18000, "min": 12000, "max": 200000, "step": 100, "software": True},
 ]
 
 # Per-role parameter schema. The cart carries the PID tuning set; the lift is
