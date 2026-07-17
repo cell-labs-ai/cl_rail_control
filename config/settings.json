@@ -15,9 +15,9 @@
   "lift": {
     "jog_speed": 400,
     "walk_catch_accel": 500,
-    "walk_catch_ma": 3500,
+    "walk_catch_ma": 5000,
     "walk_lower_speed": 200,
-    "walk_tension_ma": 200,
-    "walk_touchdown_ma": 300
+    "walk_tension_ma": 500,
+    "walk_touchdown_ma": 400
   }
 }
