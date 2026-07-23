@@ -121,7 +121,7 @@ DEFAULT_MODE = MODE_BASIC
 # neither commanded (jog_direction) nor actual (|606Ch| above the standstill
 # threshold) -- for this long, stop the motor like the STOP button does
 # (stop_motor: ramp to zero, drop out of Operation enabled, brake closes).
-LIFT_IDLE_STOP_TIMEOUT_S = 10.0
+LIFT_IDLE_STOP_TIMEOUT_S = 120.0
 
 # Walking mode, part 1: auto-lower (see _run_walk_lower). The descent speed and
 # the touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can
@@ -167,10 +167,23 @@ WALK_TENSION_ARM_TIMEOUT_S = 3.0
 # negative, so the sign convention matches pay-out). The watch differentiates
 # consecutive fresh 606Ch reads; an acceleration at or below
 # -walk_catch_accel (rpm/s) for this many consecutive sample pairs restores
-# torque by writing walk_catch_ma to 2031h. Two samples (~200 ms at the
-# 10 Hz loop) so one glitched read can't slam full current on spuriously;
-# every extra sample is fall distance, so no more than that.
-WALK_CATCH_SAMPLES = 2
+# torque by writing walk_catch_ma to 2031h.
+#
+# The fall watch paces itself FASTER than the other walk phases: there,
+# latency merely pays out a little extra rope, while here every millisecond
+# of it is fall distance. Only the velocity is read at this rate -- one bus
+# round trip per iteration, the other checks come from the cached poller
+# snapshot -- so 50 Hz adds moderate load (one read per 20 ms, next to the
+# cart PID's two round trips per 10 ms when both run). Detection worst case
+# drops from ~200-300 ms (2 pairs at the 10 Hz WALK_POLL_INTERVAL_S) to
+# ~60-80 ms.
+WALK_CATCH_POLL_INTERVAL_S = 0.02
+# Consecutive over-threshold pairs before the catch trips. Differencing over
+# 20 ms instead of 100 ms amplifies velocity noise ~5x (sigma_a ~
+# sqrt(2)*sigma_v/dt), so THREE consecutive pairs -- instead of the two used
+# at 10 Hz -- keep a glitched read or noise spike from slamming full current
+# on spuriously. Every extra sample is fall distance, so no more than that.
+WALK_CATCH_SAMPLES = 3
 
 # Simulate only: gravity's pull on the fake falling payload, in rpm/s of drum
 # speed. Started via POST /api/lift/sim_fall (simulate mode only).
@@ -690,6 +703,11 @@ class RailController:
         self._sim_angle = ANALOG_INPUT_MAX / 2
         self._sim_target_velocity = 0.0
         self._sim_last = time.monotonic()
+        # _simulate_state() integrates incrementally (dt since _sim_last) and
+        # is stepped from more than one thread: the poller, and the walk
+        # thread's fast velocity reads (see _read_velocity_rpm). The lock
+        # keeps two concurrent steps from double-counting the same dt.
+        self._sim_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -1020,7 +1038,9 @@ class RailController:
         WALK_STALL_SAMPLES, armed by upward motion or
         WALK_TENSION_ARM_TIMEOUT_S), the target velocity is zeroed and
         2031h is set to 0: no torque at all, mode and enable state
-        untouched. The thread then differentiates fresh 606Ch reads: the
+        untouched. The thread then differentiates fresh 606Ch reads -- taken
+        every WALK_CATCH_POLL_INTERVAL_S, faster than the other phases,
+        because detection latency here is fall distance: the
         torqueless drum follows the payload, so normal walking pays rope out
         gently (negative, downwards) while a fall back-drives it with a
         steep negative ramp. Acceleration <= -walk_catch_accel for
@@ -1178,7 +1198,9 @@ class RailController:
             # drum follows the payload: gentle negative pay-out is the robot
             # walking; acceleration at or below -walk_catch_accel for
             # WALK_CATCH_SAMPLES consecutive pairs is a fall. A failed read
-            # skips the pair (neither counts nor resets).
+            # skips the pair (neither counts nor resets). Paced at the fast
+            # WALK_CATCH_POLL_INTERVAL_S: only the velocity read touches the
+            # bus, the drive-state check reads the cached poller snapshot.
             last_velocity = None
             last_time = None
             rapid = 0
@@ -1205,7 +1227,7 @@ class RailController:
                     last_velocity, last_time = velocity, now
                 if rapid >= WALK_CATCH_SAMPLES:
                     break
-                self._walk_stop.wait(WALK_POLL_INTERVAL_S)
+                self._walk_stop.wait(WALK_CATCH_POLL_INTERVAL_S)
 
             # --- fall caught: torque back on ------------------------------
             catch_ma = int(self.get_params().get("walk_catch_ma", 0))
@@ -1520,7 +1542,11 @@ class RailController:
     def _read_velocity_rpm(self):
         """Velocity actual value (606Ch) in rpm, signed; None on read error."""
         if self._simulate:
-            return int(self._sim_velocity)
+            # Step the sim physics instead of returning the stored value: the
+            # poller only advances it at 10 Hz, and the fall watch samples
+            # faster than that -- differencing a 10 Hz staircase at 50 Hz
+            # reads as zero acceleration and the sim fall would never trip.
+            return self._simulate_state()["velocity_actual"]
         raw = self._read(OD_VELOCITY_ACTUAL)
         return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
 
@@ -2114,7 +2140,13 @@ class RailController:
     # -- simulation --------------------------------------------------------
 
     def _simulate_state(self):
-        """Cheap physics stub so the UI works with no hardware."""
+        """Cheap physics stub so the UI works with no hardware. Called from
+        the poller AND from fast fresh-read paths (_read_velocity_rpm), hence
+        the lock -- see _sim_lock in __init__."""
+        with self._sim_lock:
+            return self._simulate_state_locked()
+
+    def _simulate_state_locked(self):
         now = time.monotonic()
         dt = min(now - self._sim_last, 0.5)
         self._sim_last = now
