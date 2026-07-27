@@ -89,7 +89,8 @@ LIFT_SERIAL_SUFFIX = "0173"   # payload lift (template)
 #                auto-stops (same as the STOP button: drive disabled, brake
 #                closed) after LIFT_IDLE_STOP_TIMEOUT_S of no up or down
 #                movement, so the load never hangs on motor current alone
-#                for long. See _maybe_idle_stop().
+#                for long. Covers 'Quick stop active' (a triggered end stop)
+#                as well as 'Operation enabled'. See _maybe_idle_stop().
 #   * walking -- auto-lower + rope tension (see _run_walk_lower). On entering
 #                the mode, the lift (must be homed) drives down at
 #                walk_lower_speed while watching the motor current
@@ -117,11 +118,11 @@ OPERATING_MODES = [
 ]
 DEFAULT_MODE = MODE_BASIC
 
-# Basic mode, lift only: with the drive enabled but no up/down movement --
-# neither commanded (jog_direction) nor actual (|606Ch| above the standstill
-# threshold) -- for this long, stop the motor like the STOP button does
-# (stop_motor: ramp to zero, drop out of Operation enabled, brake closes).
-LIFT_IDLE_STOP_TIMEOUT_S = 120.0
+# Basic mode, lift only: with the drive still holding the axis but no up/down
+# movement -- neither commanded (jog_direction) nor actual (|606Ch| above the
+# standstill threshold) -- for this long, stop the motor like the STOP button
+# does (stop_motor: ramp to zero, leave the holding state, brake closed).
+LIFT_IDLE_STOP_TIMEOUT_S = 10.0
 
 # Walking mode, part 1: auto-lower (see _run_walk_lower). The descent speed and
 # the touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can
@@ -846,10 +847,38 @@ class RailController:
             with self._state_lock:
                 self._state = snapshot
             self._log_state_change(snapshot.get("status_word"))
+            self._sync_drive_flags(snapshot)
             self._maybe_home_at_endstop(snapshot)
             self._enforce_down_limit(snapshot)
             self._maybe_idle_stop(snapshot)
             self._stop_event.wait(STATE_POLL_INTERVAL_S)
+
+    def _sync_drive_flags(self, snapshot):
+        """Reconcile the cached drive_enabled / jog_direction flags with the
+        state the drive ACTUALLY reports (6041h).
+
+        Both flags are written by the command paths, but the drive also leaves
+        'Operation enabled' on its OWN: a triggered end stop quick-stops it,
+        the connection watchdog halts it, a fault drops it out. Nothing here
+        commanded those transitions, so without this the flags stay stuck at
+        whatever the last command left behind -- and every consumer is then
+        wrong:
+
+          * the UI keeps showing the drive as enabled;
+          * a joystick update in the same direction skips its enable walk (the
+            lazy engagement in jog_velocity) and just writes target velocities
+            into a drive that is ignoring them -- the stick looks dead until
+            the operator crosses zero;
+          * the lift's idle auto-stop keeps counting a stale jog_direction as
+            "still being driven" and never times out (see _maybe_idle_stop).
+
+        Only ever CLEARS, and only what a command path had confirmed: the
+        enable paths set drive_enabled themselves once their state-machine walk
+        has landed, and a drive glimpsed mid-walk (brake-release sequence still
+        running) must not be reported as ready from here."""
+        if self.drive_enabled and not _operation_enabled(snapshot.get("status_word")):
+            self.drive_enabled = False
+            self.jog_direction = 0
 
     def set_mode(self, mode):
         """Apply the system-wide operating mode to this controller. The idle
@@ -874,15 +903,38 @@ class RailController:
         """Basic mode, lift only: stop the drive like the STOP button does
         (brake closed) after LIFT_IDLE_STOP_TIMEOUT_S with no up or down
         movement. 'Movement' is either a commanded jog direction or an actual
-        velocity (606Ch) above the standstill threshold, so a held joystick
-        that is stalled against a limit still counts as active.
+        velocity (606Ch) above the standstill threshold, so a joystick that is
+        still driving the lift somewhere keeps the timer at bay.
 
-        Only armed while the drive is enabled (brake open, load held on motor
-        current) -- an already-stopped lift has nothing to stop -- and never
-        during homing, whose enable must not be yanked away mid-procedure."""
+        Armed off the drive state the poller just READ -- not the cached
+        drive_enabled flag -- and for every state in which the drive is still
+        holding the axis:
+
+          * 'Operation enabled': brake open, load on motor current. The case
+            this watchdog exists for.
+          * 'Quick stop active': where a triggered end stop leaves the lift.
+            The drive braked itself on the way in, but it stays energized and
+            holding, and nothing in this process commanded that transition --
+            so the cached flag still read "enabled" while the state machine had
+            already moved on. Keying on the flag meant the watchdog fired once,
+            wrote a controlword the drive does not accept in that state (see
+            stop_motor), latched drive_enabled = False on the way out and never
+            armed again: hitting the end stop switched the idle stop off.
+
+        An unreadable statusword holds the timer where it is rather than
+        restarting it, so a flaky read cannot keep postponing the stop.
+
+        Never fires during homing, whose enable must not be yanked away
+        mid-procedure."""
         if (self.role != "lift" or self.mode != MODE_BASIC
-                or not self.drive_enabled or self.homing_in_progress):
+                or self.homing_in_progress):
             self._idle_since = None
+            return
+        status_word = snapshot.get("status_word")
+        if status_word is None:
+            return
+        if not (_operation_enabled(status_word) or _quick_stop_active(status_word)):
+            self._idle_since = None      # nothing left to stop
             return
         velocity = snapshot.get("velocity_actual")
         moving = (self.jog_direction != 0
@@ -895,9 +947,15 @@ class RailController:
             return
         self._idle_since = None
         print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: no movement "
-              f"for {LIFT_IDLE_STOP_TIMEOUT_S:.0f}s in Basic mode -- "
-              f"auto-stop (brake closed)")
-        self.stop_motor()
+              f"for {LIFT_IDLE_STOP_TIMEOUT_S:.0f}s in Basic mode "
+              f"({_decode_cia402_state(status_word)}) -- auto-stop "
+              f"(brake closed)")
+        if not self.stop_motor():
+            # Say so on the console as well: the line above must not be the
+            # last word if the payload is in fact still on motor current. The
+            # timer restarts, so the next window retries.
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
+                  f"auto-stop FAILED -- {self.last_error}")
 
     # -- Walking mode: auto-lower, then rope tension -----------------------
 
@@ -1563,16 +1621,41 @@ class RailController:
         return self._write(OD_TARGET_VELOCITY, int(rpm))
 
     def stop_motor(self):
-        """Command zero velocity and drop back to 'Switched on' (controlword
-        0x07, Disable operation -- CiA-402 transition 5).
+        """Command zero velocity and take the drive out of whichever state it is
+        holding the axis in, so the load ends up on the closed brake.
 
-        0x07, not 0x06: leaving Operation enabled triggers the automatic brake
-        close sequence either way, but 0x06 (Shutdown) falls through to 'Ready
-        to switch on', one state further down. Stopping at 'Switched on' keeps
-        the power stage up and makes the next enable a SINGLE transition -- the
-        one the automatic brake control releases the brake on (manual 7.3.3) --
-        instead of a multi-step walk interleaving with the still-running brake
-        close sequence."""
+        Paced by the OBSERVED state, one command per cycle, because the two
+        holding states need DIFFERENT commands:
+
+          * 'Operation enabled' -> 0x07 (Disable operation, CiA-402 transition
+            5). 0x07, not 0x06: leaving Operation enabled triggers the
+            automatic brake close sequence either way, but 0x06 (Shutdown)
+            falls through to 'Ready to switch on', one state further down.
+            Stopping at 'Switched on' keeps the power stage up and makes the
+            next enable a SINGLE transition -- the one the automatic brake
+            control releases the brake on (manual 7.3.3) -- instead of a
+            multi-step walk interleaving with the still-running brake close
+            sequence.
+          * 'Quick stop active' (a triggered end stop) -> 0x00 (Disable
+            voltage, transition 12, landing in 'Switch on disabled'). This
+            state has NO transition on 0x07: CiA-402 leaves it only via Disable
+            voltage or, with quick stop option code 5/6/7, Enable operation
+            (0x0F, transition 16). Firing the old unconditional 0x07 here was
+            silently swallowed -- the drive stayed energized and holding while
+            this reported a successful stop, because the confirm loop below
+            only ever waited for 'Operation enabled' to clear and that had
+            already happened when the end stop hit. Transition 16 is never an
+            option: see _walk_to_operation_enabled on why the lift must not
+            re-enter Operation enabled without the brake-release sequence.
+
+        Re-issuing each cycle rather than commanding once and watching: a drive
+        busy with a brake sequence consumes commands without effect (same
+        lesson as _walk_to_operation_enabled).
+
+        Confirming the state actually left the holding states also keeps an
+        immediately following jog from reading a stale 'Operation enabled',
+        skipping its enable walk and writing a target velocity that the
+        still-running disable then discards -- a jog press that does nothing."""
         # A STOP overrides a running auto-lower: flag it so the walk thread
         # exits instead of re-commanding its descent velocity. No join here --
         # the walk thread itself calls stop_motor() on touchdown/abort.
@@ -1582,22 +1665,30 @@ class RailController:
             self._sim_target_velocity = 0.0
             self.drive_enabled = False
             return True
+        # Best-effort (last_error carries a failure): a target velocity that
+        # would not write must not stop us from disabling the drive, which is
+        # what actually removes the torque and closes the brake.
         self._write(OD_TARGET_VELOCITY, 0)
-        ok = self._write(OD_CONTROL_WORD, 0x07)
-        # Confirm the state actually LEFT Operation enabled before returning.
-        # The drive first ramps the motor to standstill and runs the brake
-        # close sequence; it reports 'Switched on' only after. Returning early
-        # would let an immediately following jog read the stale 'Operation
-        # enabled', skip its enable walk and write a target velocity that the
-        # still-running disable then discards -- a jog press that does nothing.
+        ok = True
         deadline = time.monotonic() + ENABLE_TIMEOUT_S
         while ok:
             status_word = self._read(OD_STATUS_WORD)
-            if status_word is None or not _operation_enabled(status_word):
+            if status_word is None:
                 break
+            if _quick_stop_active(status_word):
+                ok = self._write(OD_CONTROL_WORD, 0x00)
+            elif _operation_enabled(status_word):
+                ok = self._write(OD_CONTROL_WORD, 0x07)
+            else:
+                break           # no longer holding: the load is on the brake
             if time.monotonic() >= deadline:
+                # Still holding the axis: report the failure rather than the
+                # old "the controlword write went out fine" -- callers (the
+                # STOP route, the idle auto-stop) need to know the load did
+                # not end up on the brake.
                 self.last_error = ("stop commanded but drive still reports "
-                                   "Operation enabled")
+                                   f"{_decode_cia402_state(status_word)}")
+                ok = False
                 break
             time.sleep(ENABLE_POLL_S)
         self.drive_enabled = False
@@ -1629,6 +1720,32 @@ class RailController:
         if position is None:
             position = self.get_state().get("position_actual")
         return position is not None and position <= LIFT_DOWN_POSITION_LIMIT
+
+    def _endstop_blocks(self, direction, state):
+        """True (with last_error set) when a triggered limit switch blocks this
+        direction: the positive limit switch blocks the positive direction and
+        vice versa, matching the C5-E's own NLS/PLS naming. The opposite
+        direction always stays available so the axis can be driven back off the
+        switch.
+
+        A blocked request also RELEASES a jog that was still running in that
+        direction. Refusing it while leaving jog_direction pointing at the
+        blocked direction told the rest of the system the operator was still
+        driving -- which kept the lift's idle auto-stop from ever timing out
+        (see _maybe_idle_stop) while the joystick was held into the end stop --
+        and left the last target velocity standing on the drive, ready to be
+        executed the moment it recovers out of 'Quick stop active'."""
+        if direction > 0 and state.get("pos_limit"):
+            blocked, allowed = "positive", "negative"
+        elif direction < 0 and state.get("neg_limit"):
+            blocked, allowed = "negative", "positive"
+        else:
+            return False
+        if self.jog_direction == direction:
+            self.jog_stop()
+        self.last_error = (f"{blocked} end stop triggered -- only {allowed} "
+                           "direction allowed")
+        return True
 
     def jog(self, direction):
         """Start jogging: direction is -1, 0 or +1. Enables the drive on
@@ -1662,12 +1779,7 @@ class RailController:
             self.last_error = "lower travel limit reached -- down disabled"
             return False, self.last_error
 
-        state = self.get_state()
-        if direction > 0 and state.get("pos_limit"):
-            self.last_error = "positive end stop triggered -- only negative direction allowed"
-            return False, self.last_error
-        if direction < 0 and state.get("neg_limit"):
-            self.last_error = "negative end stop triggered -- only positive direction allowed"
+        if self._endstop_blocks(direction, self.get_state()):
             return False, self.last_error
 
         if not self._ensure_operation_enabled():
@@ -1718,12 +1830,7 @@ class RailController:
             self.last_error = "lower travel limit reached -- down disabled"
             return False, self.last_error
 
-        state = self.get_state()
-        if direction > 0 and state.get("pos_limit"):
-            self.last_error = "positive end stop triggered -- only negative direction allowed"
-            return False, self.last_error
-        if direction < 0 and state.get("neg_limit"):
-            self.last_error = "negative end stop triggered -- only positive direction allowed"
+        if self._endstop_blocks(direction, self.get_state()):
             return False, self.last_error
 
         # Only run the (heavy) enable + ramp setup when engaging from rest or
@@ -1931,9 +2038,10 @@ class RailController:
         background thread by _maybe_home_at_endstop() when the lift was NOT on
         the end stop at startup and the operator has now driven it up into one.
         Sets homing_complete = True on success, which lifts the down-motion lock;
-        on failure the lock stays in place and the next poll retries after
-        HOMING_RETRY_INTERVAL_S. homing_in_progress guards re-entry and is always
-        cleared on exit."""
+        on failure the lock stays in place, the drive is stopped (brake closed)
+        and the next poll retries HOMING_RETRY_INTERVAL_S after this attempt
+        ENDED. homing_in_progress guards re-entry and is always cleared on
+        exit."""
         try:
             if self._simulate:
                 self.homing_complete = True
@@ -1959,6 +2067,24 @@ class RailController:
         finally:
             if not self._simulate:
                 self._leave_homing_mode(keep_enabled=True)
+                if not self.homing_complete:
+                    # A FAILED attempt must not walk away leaving the lift on
+                    # motor current: every exit above ran through
+                    # _enable_keep_mode / keep_enabled=True, so the brake is
+                    # open, and the next retry is HOMING_RETRY_INTERVAL_S away
+                    # with the idle auto-stop held off the whole time
+                    # (homing_in_progress). A home that keeps failing would
+                    # otherwise hold the payload on current indefinitely. The
+                    # lift is resting on the top end stop; the closed brake
+                    # holds it.
+                    self.stop_motor()
+            # Stamp the retry gap from the END of the attempt. Stamped only at
+            # the start, a failing attempt that takes longer than
+            # HOMING_RETRY_INTERVAL_S (each step here has a multi-second
+            # timeout) is already overdue when it finishes, so the next poll
+            # re-fires immediately: homing_in_progress would then never be
+            # clear for long enough for the idle auto-stop to time out.
+            self._last_homing_attempt = time.monotonic()
             self.homing_in_progress = False
 
     def _wait_for_homing(self):
