@@ -2725,6 +2725,24 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter logging
         pass
 
+    def end_headers(self):
+        """Every response (including send_error's) goes through here, so this
+        is the one place to add CORS: LAN-only deployment with no
+        credentials, so a wildcard origin is fine -- lets a browser page
+        served from elsewhere (e.g. the robot's web UI, a different origin)
+        call this API cross-origin."""
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
+    def do_OPTIONS(self):
+        """CORS preflight. Browsers send this before a cross-origin POST
+        whose Content-Type is application/json (not a "simple" type) to ask
+        which methods/headers are allowed before sending the real request."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
     # -- helpers -----------------------------------------------------------
 
     def _send_json(self, obj, status=200):
