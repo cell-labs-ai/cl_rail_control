@@ -103,7 +103,7 @@ DEFAULT_MODE = MODE_BASIC
 # movement -- neither commanded (jog_direction) nor actual (|606Ch| above the
 # standstill threshold) -- for this long, stop like the STOP button does (see
 # stop_motor: ramp to zero, leave the holding state, brake closed).
-LIFT_IDLE_STOP_TIMEOUT_S = 10.0
+LIFT_IDLE_STOP_TIMEOUT_S = 120.0
 
 # Manual-drive deadman. A joystick hold is a LEASE, not a latch: the UI repeats
 # the current stick velocity every JOY_HOLD_INTERVAL_MS (app.js) while the
