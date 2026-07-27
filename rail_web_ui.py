@@ -2,36 +2,28 @@
 """
 Web UI for the rail system.
 
-Serves a single-page control panel (see the webui/ folder) plus a small JSON
-API for two Nanotec motor controllers:
+Serves a single-page control panel (webui/) plus a small JSON API for two
+Nanotec motor controllers on the same Modbus TCP (WiFi) bus:
 
-  * CART  -- the cart that runs along the rail        (serial ends in "0168")
-  * LIFT  -- pulls the hanging payload up and down     (serial ends in "0173")
+  * CART  -- runs along the rail                 (serial ends in "0168")
+  * LIFT  -- raises/lowers the hanging payload   (serial ends in "0173")
 
-Both controllers live on the same Modbus TCP (WiFi) bus. The connection /
-discovery logic mirrors test_controllers.py and motion_test.py: list the
-Modbus TCP bus hardware, scan it, and keep the two devices whose serial
-numbers match. There is no way to target a device by IP directly (see the
-note in motion_test.py), so discovery-by-scan is the only path.
+Discovery mirrors test_controllers.py / motion_test.py: list the Modbus TCP bus
+hardware, scan it, keep the devices whose serials match. Devices cannot be
+targeted by IP (see the note in motion_test.py), so scanning is the only path.
 
-The UI provides, per controller:
-  * a parameter section (jog controls), and
-  * a spring-return one-axis joystick for manual drive plus a STOP.
+Each controller gets a parameter section plus a spring-return one-axis joystick
+and a STOP. Stick displacement sets the target velocity (0 at centre, +/- the
+full-scale joy speed at the ends); a held stick is a lease, not a latch -- the
+UI repeats it and the drive stops itself when the repeats stop, so a lost
+release still stops the axis (see JOG_DEADMAN_TIMEOUT_S). The CART carries joy
+max speed, accel/jerk and the PID gains (Kp/Ki/Kd) with a start/stop for the
+software balance loop; the LIFT has joy max speed only -- no accel/jerk, no
+PID, no analog-angle readout.
 
-The manual drive is a joystick: stick displacement sets the target velocity
-(0 at centre, +/- the full-scale joy speed at the ends), springing back to
-zero when released. A held stick is a lease, not a latch -- the UI repeats the
-command while it is held and the drive stops itself when the repeats stop, so
-letting go stops the axis even if the release never reaches the server (see
-JOG_DEADMAN_TIMEOUT_S). The CART carries the full set -- joy max speed plus
-acceleration/jerk, plus PID gain tuning (Kp/Ki/Kd) with a start/stop for the
-software balance loop. The LIFT is pared down to just the joy max speed: no
-jog accel/jerk, no PID, and no analog-angle readout.
-
-The CART is fully wired up. The LIFT reuses most of the readout, and its
-motion is templated (lift_up / lift_down) -- the drive is the same generic
-Profile Velocity move as the cart, with TODO markers where the real lift
-kinematics / travel limits / homing belong.
+The CART is fully wired up. The LIFT reuses the readout and its motion is
+templated (lift_up / lift_down): the same generic Profile Velocity move, with
+TODO markers where the real kinematics / travel limits / homing belong.
 
 Usage (inside the project virtualenv, from the repo root):
     source .venv/bin/activate
@@ -41,8 +33,8 @@ Usage (inside the project virtualenv, from the repo root):
 
 Then open http://<pi-address>:8080/ in a browser.
 
-IMPORTANT: as with the other scripts, make sure no other tool is talking to
-the controllers while this runs.
+IMPORTANT: make sure no other tool is talking to the controllers while this
+runs.
 """
 
 import argparse
@@ -55,16 +47,16 @@ import time
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# The nanolib package lives under nanolib_python_linux; make it importable
-# regardless of the current working directory (same as the other scripts).
+# nanolib lives under nanolib_python_linux; make it importable regardless of
+# the current working directory (same as the other scripts).
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "nanolib_python_linux"))
 _WEBUI_DIR = os.path.join(_REPO_ROOT, "webui")
 _CONFIG_DIR = os.path.join(_REPO_ROOT, "config")
 _SETTINGS_FILE = os.path.join(_CONFIG_DIR, "settings.json")
 
-# nanolib is only importable on the target (aarch64) device and only needed
-# for real hardware; --simulate must work even where it can't be imported.
+# Only importable on the target (aarch64) device and only needed for real
+# hardware; --simulate must work where it can't be imported.
 try:
     from nanotec_nanolib import Nanolib
     _NANOLIB_IMPORT_ERROR = None
@@ -85,33 +77,19 @@ LIFT_SERIAL_SUFFIX = "0173"   # payload lift (template)
 # ---------------------------------------------------------------------------
 #
 # One system-wide operating mode, switched from the UI topbar and applied to
-# every controller. Adding a mode is a data change here plus whatever
-# behaviour it gates (grep for self.mode in RailController).
+# every controller. Adding a mode is a data change here plus whatever behaviour
+# it gates (grep for self.mode in RailController).
 #
-#   * basic   -- everything works as before, with one addition: the LIFT
-#                auto-stops (same as the STOP button: drive disabled, brake
-#                closed) after LIFT_IDLE_STOP_TIMEOUT_S of no up or down
-#                movement, so the load never hangs on motor current alone
-#                for long. Covers 'Quick stop active' (a triggered end stop)
-#                as well as 'Operation enabled'. See _maybe_idle_stop().
-#   * walking -- auto-lower + rope tension (see _run_walk_lower). On entering
-#                the mode, the lift (must be homed) drives down at
-#                walk_lower_speed while watching the motor current
-#                (2039h:05h); when the payload grounds, the load transfers
-#                off the rope and the current magnitude drops below
-#                walk_touchdown_ma -> touchdown. The drive then STAYS in
-#                Operation enabled / Profile Velocity: Max Motor Current
-#                (2031h) is lowered to walk_tension_ma and the velocity
-#                command reversed upward, so the motor reels in slack and
-#                stalls against the payload, keeping the rope tensioned.
-#                Once stalled, the target velocity is zeroed and 2031h goes
-#                to 0 (no torque; mode and enable state stay untouched); the
-#                fall catch watches the drum: acceleration more negative
-#                than walk_catch_accel (a falling payload back-driving the
-#                torqueless drum) slams 2031h to walk_catch_ma -- with the
-#                target at 0, the drive arrests the fall and holds. The
-#                original 2031h is restored whenever the sequence ends. No
-#                lift idle auto-stop in this mode.
+#   * basic   -- as before, plus: the LIFT auto-stops (like the STOP button:
+#                drive disabled, brake closed) after LIFT_IDLE_STOP_TIMEOUT_S
+#                without up or down movement, so the load never hangs on motor
+#                current for long. Covers 'Quick stop active' (a triggered end
+#                stop) as well as 'Operation enabled'. See _maybe_idle_stop().
+#   * walking -- auto-lower, rope tension and fall catch, all on the lift
+#                (which must be homed): lower until the motor current says the
+#                payload has grounded, reel the slack taut at limited current,
+#                then drop to zero torque and watch the drum for a fall. Full
+#                sequence in _run_walk_lower. No idle auto-stop in this mode.
 
 MODE_BASIC = "basic"
 MODE_WALKING = "walking"
@@ -121,60 +99,55 @@ OPERATING_MODES = [
 ]
 DEFAULT_MODE = MODE_BASIC
 
-# Basic mode, lift only: with the drive still holding the axis but no up/down
+# Basic mode, lift only: with the drive holding the axis but no up/down
 # movement -- neither commanded (jog_direction) nor actual (|606Ch| above the
-# standstill threshold) -- for this long, stop the motor like the STOP button
-# does (stop_motor: ramp to zero, leave the holding state, brake closed).
+# standstill threshold) -- for this long, stop like the STOP button does (see
+# stop_motor: ramp to zero, leave the holding state, brake closed).
 LIFT_IDLE_STOP_TIMEOUT_S = 10.0
 
 # Manual-drive deadman. A joystick hold is a LEASE, not a latch: the UI repeats
-# the current stick velocity every JOY_HOLD_INTERVAL_MS (app.js) while the stick
-# is held, and every non-zero jog_velocity extends the lease by this much. When
-# the updates stop, _enforce_jog_deadman ramps the axis to zero -- so the axis
-# stops on the ABSENCE of input rather than needing a stop message to arrive.
-# That covers every way the release used to get lost:
-#
-#   * the release (velocity 0) POST failing, or being overtaken by a drag
-#     update that was already in flight (see also the seq guard in
-#     jog_velocity, which rejects the reordered one outright);
-#   * pointerup never firing at all -- lost pointer capture, a tab switch, a
-#     long-press context menu, screen lock;
-#   * the frontend going away mid-drag: browser tab closed, laptop asleep,
-#     WiFi dropped. Nothing can be sent then, which is exactly the point.
+# the current stick velocity every JOY_HOLD_INTERVAL_MS (app.js) while the
+# stick is held, and every non-zero jog_velocity extends the lease by this
+# much. When the updates stop, _enforce_jog_deadman ramps the axis to zero --
+# it stops on the ABSENCE of input rather than needing a stop message to
+# arrive. That covers a release POST that fails or is overtaken by an in-flight
+# drag update (see also the seq guard in jog_velocity), a pointerup that never
+# fires (lost pointer capture, tab switch, context menu, screen lock), and the
+# frontend going away mid-drag (tab closed, laptop asleep, WiFi dropped).
 #
 # Sized at 3-4 missed updates so a couple of dropped/late posts on the shared
 # WiFi bus don't nuisance-stop a drive that is still being steered. Worst-case
 # unwanted motion is this plus one STATE_POLL_INTERVAL_S (the poller runs the
 # check), i.e. ~450 ms of coasting at the commanded velocity.
 #
-# NB this guards the joystick path (jog_velocity) only. It deliberately does
-# NOT touch the PID loop or the Walking-mode auto-lower: those are autonomous
-# server-side behaviours -- the latter being the fall catch -- and must keep
-# running when a browser tab closes. It is also a mitigation, not a safety
-# function: the drive is not safety-rated, so the authoritative stop stays the
-# hardware chain (e-stop contactor + fail-safe brake).
+# Guards the joystick path (jog_velocity) only: the PID loop and the
+# Walking-mode auto-lower are autonomous server-side behaviours -- the latter
+# being the fall catch -- and must keep running when a browser tab closes. It
+# is a mitigation, not a safety function: the drive is not safety-rated, so the
+# authoritative stop stays the hardware chain (e-stop contactor + fail-safe
+# brake).
 JOG_DEADMAN_TIMEOUT_S = 0.35
-# Prefix of the last_error the deadman raises. Used to recognise its own message
-# and retract it when manual drive engages again, so a fired timeout does not sit
-# in the UI's error line over an axis that is now being driven normally. Other
-# errors (end stop, travel limit) are left alone.
+# Prefix of the last_error the deadman raises, so it can recognise and retract
+# its own message when manual drive engages again -- a fired timeout must not
+# sit in the UI's error line over an axis that is being driven normally again.
+# Other errors (end stop, travel limit) are left alone.
 JOG_DEADMAN_MESSAGE = "manual drive timed out"
 
-# Walking mode, part 1: auto-lower (see _run_walk_lower). The descent speed and
-# the touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can
-# be calibrated live from the UI; the loop pacing and debounce live here.
+# Walking mode, part 1: auto-lower (see _run_walk_lower). Descent speed and
+# touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can be
+# calibrated live from the UI; the loop pacing and debounce live here.
 #
-# The touchdown detector is only ARMED once |606Ch| has reached this fraction
-# of the commanded descent speed -- the current is not meaningful during the
-# acceleration ramp and would false-trigger the threshold.
+# The touchdown detector only ARMS once |606Ch| has reached this fraction of
+# the commanded descent speed -- during the acceleration ramp the current is
+# not meaningful and would false-trigger the threshold.
 WALK_ARM_VELOCITY_FRACTION = 0.8
 # One touchdown check per interval (two bus round trips: fresh current +
-# velocity reads). 10 Hz keeps the shared WiFi bus load moderate; with the
-# debounce below, detection lags touchdown by a few hundred ms, which merely
-# pays out a little extra rope -- harmless.
+# velocity). 10 Hz keeps the shared WiFi load moderate; with the debounce
+# below, detection lags touchdown by a few hundred ms, which merely pays out a
+# little extra rope.
 WALK_POLL_INTERVAL_S = 0.1
-# Consecutive samples with |current| below the threshold before it counts as
-# touchdown, so a single noisy/low sample can't stop the descent early.
+# Consecutive below-threshold samples before it counts as touchdown, so a
+# single noisy sample can't stop the descent early.
 WALK_TOUCHDOWN_SAMPLES = 3
 # Descent that neither touches down nor hits a limit within this long is
 # aborted (stop, brake closed) -- covers a miscalibrated threshold with the
@@ -183,67 +156,61 @@ WALK_LOWER_TIMEOUT_S = 180.0
 
 # Walking mode, part 2: tension phase (see _run_walk_lower). After touchdown
 # the drive stays in Operation enabled / Profile Velocity; Max Motor Current
-# (2031h) is lowered to the walk_tension_ma param and the target velocity
-# reversed upward, so the motor reels in slack but stalls against the grounded
-# payload's weight, holding the rope at tension current. Once that stall is
-# seen, 2031h goes to 0 (no torque at all) with mode / enable / commanded
-# velocity untouched.
+# (2031h) is lowered to walk_tension_ma and the target velocity reversed
+# upward, so the motor reels in slack but stalls against the grounded payload's
+# weight. Once that stall is seen, 2031h goes to 0 (no torque at all) with mode
+# / enable / commanded velocity untouched.
 #
 # Stall = |606Ch| at standstill for this many consecutive samples ...
 WALK_STALL_SAMPLES = 3
-# ... but only once the detector is armed: either the lift was seen actually
-# moving up (reeling slack), or this long has passed since the tension phase
-# started -- covers a touchdown with so little slack that the reel-in stalls
-# before ever reaching detectable speed. Needed because velocity passes
-# through zero anyway while reversing from the descent.
+# ... but only once armed: either the lift was seen actually moving up (reeling
+# slack), or this long has passed since the tension phase started -- covers a
+# touchdown with so little slack that the reel-in stalls before reaching
+# detectable speed. Needed because velocity passes through zero anyway while
+# reversing from the descent.
 WALK_TENSION_ARM_TIMEOUT_S = 3.0
 
-# Walking mode, part 3: fall catch (see _run_walk_lower phase 3). While the
-# current is zeroed, the drum is torqueless and a falling payload back-drives
-# it: velocity ramps NEGATIVE fast (desired/normal motion is downwards, i.e.
-# negative, so the sign convention matches pay-out). The watch differentiates
-# consecutive fresh 606Ch reads; an acceleration at or below
+# Walking mode, part 3: fall catch (see _run_walk_lower phase 3). With the
+# current zeroed the drum is torqueless and a falling payload back-drives it:
+# velocity ramps NEGATIVE fast (pay-out is the negative direction). The watch
+# differentiates consecutive fresh 606Ch reads; acceleration at or below
 # -walk_catch_accel (rpm/s) for this many consecutive sample pairs restores
 # torque by writing walk_catch_ma to 2031h.
 #
-# The fall watch paces itself FASTER than the other walk phases: there,
-# latency merely pays out a little extra rope, while here every millisecond
-# of it is fall distance. Only the velocity is read at this rate -- one bus
-# round trip per iteration, the other checks come from the cached poller
-# snapshot -- so 50 Hz adds moderate load (one read per 20 ms, next to the
-# cart PID's two round trips per 10 ms when both run). Detection worst case
-# drops from ~200-300 ms (2 pairs at the 10 Hz WALK_POLL_INTERVAL_S) to
-# ~60-80 ms.
+# Paced FASTER than the other walk phases: there latency merely pays out a
+# little extra rope, here every millisecond of it is fall distance. Only the
+# velocity is read at this rate -- one bus round trip per iteration, the other
+# checks come from the cached poller snapshot -- so 50 Hz adds moderate load.
+# Detection worst case drops from ~200-300 ms (2 pairs at 10 Hz) to ~60-80 ms.
 WALK_CATCH_POLL_INTERVAL_S = 0.02
 # Consecutive over-threshold pairs before the catch trips. Differencing over
 # 20 ms instead of 100 ms amplifies velocity noise ~5x (sigma_a ~
-# sqrt(2)*sigma_v/dt), so THREE consecutive pairs -- instead of the two used
-# at 10 Hz -- keep a glitched read or noise spike from slamming full current
-# on spuriously. Every extra sample is fall distance, so no more than that.
+# sqrt(2)*sigma_v/dt), so THREE pairs instead of the two used at 10 Hz keep a
+# glitched read from slamming full current on spuriously. Every extra sample is
+# fall distance, so no more than that.
 WALK_CATCH_SAMPLES = 3
 
 # Simulate only: gravity's pull on the fake falling payload, in rpm/s of drum
-# speed. Started via POST /api/lift/sim_fall (simulate mode only).
+# speed. Started via POST /api/lift/sim_fall.
 SIM_FALL_ACCEL_RPM_S = 800
 
 # Simulate only: the position (6064h counts) where the fake payload "touches
-# ground". Below it the load is off the rope: the drum keeps unwinding (slack
-# rope, like the real rig), but the simulated motor current collapses to a
-# small friction term (see _sim_current), so the touchdown detector fires and
-# the whole auto-lower sequence is exercisable without hardware.
+# ground". Below it the drum keeps unwinding (slack rope, like the real rig)
+# but the simulated motor current collapses to a small friction term (see
+# _sim_current), so the touchdown detector fires and the whole sequence is
+# exercisable without hardware.
 SIM_GROUND_POSITION = -2000
 # Simulate only: stand-ins for the current-limit physics. The fake payload
-# "needs" SIM_LIFT_HOLD_CURRENT_MA to be lifted: with 2031h limited below
-# that, upward motion stalls at the taut-rope position (SIM_GROUND_POSITION);
-# with the limit at 0 the drum produces no torque and stands still.
-# SIM_MAX_CURRENT_MA is what a 2031h read returns in simulate.
+# "needs" SIM_LIFT_HOLD_CURRENT_MA to be lifted: with 2031h below that, upward
+# motion stalls at the taut-rope position (SIM_GROUND_POSITION); at 0 the drum
+# produces no torque and stands still. SIM_MAX_CURRENT_MA is what a 2031h read
+# returns in simulate.
 SIM_MAX_CURRENT_MA = 2000
 SIM_LIFT_HOLD_CURRENT_MA = 800
 
-# Poll rate for the live readout shown in the UI. Slower than motion_test.py's
-# 50 Hz control poll -- this only feeds a browser display and shares the bus
-# lock with the control writes, so 10 Hz keeps the UI responsive without
-# starving commands.
+# Poll rate for the UI's live readout. Slower than motion_test.py's 50 Hz
+# control poll: this only feeds a browser display and shares the bus lock with
+# the control writes, so 10 Hz stays responsive without starving commands.
 STATE_POLL_INTERVAL_S = 0.1
 
 
@@ -256,93 +223,89 @@ OD_STATUS_WORD = (0x6041, 0x00, 16)
 OD_NANOJ_CONTROL = (0x2300, 0x00, 32)
 OD_MODE_OF_OPERATION = (0x6060, 0x00, 8)
 # Modes of operation display (6061h): the mode the drive is ACTUALLY running,
-# which lags the 6060h command by up to a drive cycle. Poll this after writing
-# 6060h before trusting any mode-dependent object (notably statusword bit 12).
+# lagging the 6060h command by up to a drive cycle. Poll it after writing 6060h
+# before trusting any mode-dependent object (notably statusword bit 12).
 OD_MODE_OF_OPERATION_DISPLAY = (0x6061, 0x00, 8)
 OD_TARGET_VELOCITY = (0x60FF, 0x00, 32)
 # Velocity actual value (606Ch), signed, in rpm. Read directly (rather than via
-# the mode-dependent statusword speed flag) to tell whether the motor is at rest.
+# the mode-dependent statusword speed flag) to tell whether the motor is at
+# rest.
 OD_VELOCITY_ACTUAL = (0x606C, 0x00, 32)
-# Digital Inputs (60FDh): bit 0 = negative limit switch (NLS), bit 1 =
-# positive limit switch (PLS) -- see C5-E manual, chapter 10 "60FDh Digital
-# Inputs" and chapter 7.1.2 "Digital inputs".
+# Digital Inputs (60FDh): bit 0 = negative limit switch (NLS), bit 1 = positive
+# limit switch (PLS). See C5-E manual ch.10 "60FDh Digital Inputs" and
+# ch.7.1.2.
 OD_DIGITAL_INPUTS = (0x60FD, 0x00, 32)
 DIGITAL_INPUT_BIT_NEG_LIMIT = 0
 DIGITAL_INPUT_BIT_POS_LIMIT = 1
 
 # Digital Outputs (60FEh:01h "Physical Outputs"): bit 0 = BRK, the brake output
-# -- value "1" means the brake is activated (closed, no current flows), "0"
-# means released. See C5-E manual chapter 10 "60FEh Digital Outputs".
+# -- "1" = brake activated (closed, no current flows), "0" = released. See C5-E
+# manual ch.10 "60FEh Digital Outputs".
 OD_DIGITAL_OUTPUTS = (0x60FE, 0x01, 32)
 DIGITAL_OUTPUT_BIT_BRAKE = 0
 
-# Motor Currents (2039h:05h "Actual Current"): the total motor current in mA,
-# calculated down to one phase (total / sqrt(2)); in closed-loop it carries the
-# sign of Iq. INTEGER32 (signed). See C5-E manual chapter 10 "2039h Motor
-# Currents". Comparable to the current from 6075h/2031h/203Bh:05h.
+# Motor Currents (2039h:05h "Actual Current"): total motor current in mA
+# calculated down to one phase (total / sqrt(2)), signed (INTEGER32) and
+# carrying Iq's sign in closed loop. See C5-E manual ch.10.
 OD_MOTOR_CURRENT_ACTUAL = (0x2039, 0x05, 32)
 
 # Max Motor Current (2031h:00h, UNSIGNED32, mA): "all current values are
-# limited by this value" (C5-E manual chapter 10). The Walking-mode tension
-# phase lowers it at runtime to turn the velocity-mode drive into a
-# tension-limited winch, and MUST restore the original afterwards -- with it
-# lowered, the lift cannot produce lifting torque. Runtime writes are
-# RAM-only, so a power cycle also restores the drive's saved value.
+# limited by this value" (C5-E manual ch.10). The Walking-mode tension phase
+# lowers it at runtime to turn the velocity-mode drive into a tension-limited
+# winch, and MUST restore the original -- while lowered, the lift cannot
+# produce lifting torque. Runtime writes are RAM-only, so a power cycle also
+# restores the saved value.
 OD_MAX_MOTOR_CURRENT = (0x2031, 0x00, 32)
 
-# Connection watchdog heartbeat. Each controller runs a NanoJ program that
-# maps user object 2400h:01h ("NodeGuard", S32) as input and stops the drive
-# (writes controlword 6040h = 0) when the value stops CHANGING for its TimeOut
-# (100 ms). The program arms itself on the first nonzero value it sees, so a
-# freshly power-cycled drive that is never fed stays unaffected.
+# Connection watchdog heartbeat. Each controller runs a NanoJ program that maps
+# user object 2400h:01h ("NodeGuard", S32) as input and stops the drive
+# (controlword 6040h = 0) when the value stops CHANGING for its TimeOut
+# (100 ms). It arms itself on the first nonzero value, so a freshly
+# power-cycled drive that is never fed stays unaffected.
 #
-# This side therefore writes an incrementing counter to 2400h:01h from a
-# dedicated thread per controller (see _heartbeat_loop). If this process dies,
-# the Pi crashes or the WiFi/Modbus link drops, the counter freezes and the
-# drive halts itself ~TimeOut later. NB once armed, the watchdog stays armed
-# until the controller is power-cycled -- so after this script has run, other
-# tools (motion_test.py, ...) that don't feed 2400h:01h will have the drive
-# stopping on them until a power cycle.
+# This side writes an incrementing counter from a dedicated thread per
+# controller (see _heartbeat_loop). If this process dies, the Pi crashes or the
+# WiFi/Modbus link drops, the counter freezes and the drive halts itself
+# ~TimeOut later. NB once armed the watchdog stays armed until the controller
+# is power-cycled -- so after this script has run, other tools (motion_test.py,
+# ...) that don't feed 2400h:01h will have the drive stopping on them.
 #
-# The interval must sit comfortably below the NanoJ TimeOut: 25 ms gives ~4
-# heartbeats per 100 ms window. Over WiFi a single retransmit can eat most of
-# that margin -- if nuisance stops occur, raise TimeOut in the NanoJ program
-# rather than shortening the interval (the bus is shared with the state
-# poller and the 100 Hz PID loop, so more writes just add congestion).
+# The interval must sit comfortably below the NanoJ TimeOut. If nuisance stops
+# occur, raise TimeOut in the NanoJ program rather than shortening the
+# interval: the bus is shared with the state poller and the 100 Hz PID loop, so
+# more writes just add congestion.
 OD_HEARTBEAT = (0x2400, 0x01, 32)
 HEARTBEAT_INTERVAL_S = 0.1
 # The counter stays in 1..HEARTBEAT_MAX (S32 positive range): 0 is skipped
 # because the NanoJ program treats it as "not armed yet".
 HEARTBEAT_MAX = 0x7FFFFFFF
 
-# Statusword (6041h) state-machine mask/pattern (see decodeStatusword() in
-# app.js for the full state table).
+# Statusword (6041h) state-machine mask/pattern (full state table in
+# decodeStatusword(), app.js).
 STATUSWORD_STATE_MASK = 0x6F
 STATUSWORD_QUICK_STOP_ACTIVE = 0x07
 STATUSWORD_OPERATION_ENABLED = 0x27
 
-# Quick Stop Option Code (605Ah) is configured on the controller itself and is
-# NOT written from here. It decides what the drive does on a quick stop (e.g. a
-# limit switch): codes 5/6/7 brake and STAY in 'Quick stop active', so recovery
-# is the direct bit-2 edge (CiA-402 transition 16); codes 0/1/2 brake and drop to
-# 'Switch on disabled', forcing the long shutdown -> switch on -> enable path.
-# Every enable/homing path below handles BOTH, so they work with whatever the
-# drive is configured with -- see _enable_keep_mode() / _ensure_operation_enabled().
+# Quick Stop Option Code (605Ah) is configured on the controller, NOT written
+# from here. It decides what the drive does on a quick stop (e.g. a limit
+# switch): codes 5/6/7 brake and STAY in 'Quick stop active', so recovery is
+# the direct bit-2 edge (CiA-402 transition 16); codes 0/1/2 drop to 'Switch on
+# disabled', forcing the long shutdown -> switch on -> enable path. Every
+# enable/homing path below handles BOTH -- see _enable_keep_mode() /
+# _ensure_operation_enabled().
 
 # Homing mode (mode of operation 6). After connecting the lift we switch to it
-# and read statusword bit 12 ("Homing attained") to see whether homing has
-# already been performed -- see C5-E manual p.79. If it has not, and the lift is
-# already resting on the top end stop, we home on the spot with homing method 35
-# (6098h): take the CURRENT position as the home/zero reference -- no motion
-# (see C5-E manual "6098h Homing Method").
+# and read statusword bit 12 ("Homing attained", C5-E manual p.79) to see
+# whether homing has already been performed. If not, and the lift is already
+# resting on the top end stop, we home on the spot with homing method 35
+# (6098h): take the CURRENT position as the home/zero reference, no motion.
 DRIVE_MODE_HOMING = 6
 STATUSWORD_HOMING_ATTAINED_BIT = 12
 STATUSWORD_HOMING_ERROR_BIT = 13
-# NB statusword bit 12 is mode-dependent: in Homing mode it is "Homing attained"
-# (above), in Profile Velocity mode it is the "Speed" flag (1 = speed is 0). Only
-# read it once _wait_for_mode() has confirmed which mode the drive is actually
-# running. Standstill is taken from 606Ch instead (see _read_velocity_rpm), which
-# means the same thing in every mode.
+# NB bit 12 is mode-dependent: "Homing attained" in Homing mode, the "Speed"
+# flag (1 = speed is 0) in Profile Velocity. Only read it once _wait_for_mode()
+# has confirmed which mode the drive is running. Standstill comes from 606Ch
+# instead (see _read_velocity_rpm), which means the same in every mode.
 OD_HOMING_METHOD = (0x6098, 0x00, 8)
 HOMING_METHOD_CURRENT_POSITION = 35
 # Controlword to start homing: Enable operation (0x0F) with bit 4 ("Homing
@@ -353,52 +316,49 @@ CONTROLWORD_START_HOMING = 0x1F
 HOMING_TIMEOUT_S = 10.0
 HOMING_POLL_S = 0.05
 # Bounded wait for a 6060h mode change to take effect (6061h reads back the
-# requested mode). Needed because statusword bit 12 is mode-dependent -- reading
-# it before Homing mode is actually active reads the old mode's meaning (in
-# Profile Velocity that is the speed-0 flag, which is 1 at standstill and would
-# masquerade as "Homing attained").
+# requested mode). Needed because bit 12 is mode-dependent: read before Homing
+# mode is actually active, it carries the old mode's meaning -- in Profile
+# Velocity the speed-0 flag, which is 1 at standstill and would masquerade as
+# "Homing attained".
 #
 # NB the drive does NOT take a 6060h mode change while in 'Quick stop active'
 # (seen on the rig: the lift starting on its end stop never entered Homing
-# mode). Recover to 'Operation enabled' first, then switch modes -- see
-# check_homing() / _run_endstop_homing().
+# mode). Recover to 'Operation enabled' first -- see check_homing() /
+# _run_endstop_homing().
 MODE_SWITCH_TIMEOUT_S = 1.0
 MODE_SWITCH_POLL_S = 0.02
 # Minimum gap between auto-homing attempts, so a homing that keeps failing (bad
-# drive config, etc.) retries at a slow, non-hammering cadence rather than every
-# poll cycle while the lift sits on the top end stop.
+# drive config, ...) retries at a slow cadence rather than every poll cycle
+# while the lift sits on the top end stop.
 HOMING_RETRY_INTERVAL_S = 5.0
 # |606Ch| at or below this (rpm) counts as standstill when deciding whether the
-# lift is resting on the top end stop. Not 0: a closed-loop drive holding against
+# lift rests on the top end stop. Not 0: a closed-loop drive holding against
 # the stop jitters by a few rpm.
 VELOCITY_ZERO_RPM = 5
 
 # Lift only: soft lower travel limit, as a Position actual value (6064h) count
-# relative to the home reference set at the top end stop when homing. Downward
-# motion (the negative jog direction) is blocked once the lift reaches this
-# position, so the payload can't be driven past the bottom of its travel.
+# relative to the home reference set at the top end stop. Downward motion (the
+# negative jog direction) is blocked once the lift reaches it, so the payload
+# can't be driven past the bottom of its travel.
 #
-# This is enforced in software (see _down_position_blocked / _enforce_down_limit)
+# Enforced in software (see _down_position_blocked / _enforce_down_limit)
 # because the lift runs in Profile Velocity mode, where the drive's own 607Dh
-# software position limits do not apply. It is NOT exposed in the UI -- set it
-# here to match the rig, e.g. jog down to the lowest safe point after homing and
-# read the Position actual value off the live readout.
+# software position limits do not apply. NOT exposed in the UI -- set it here
+# to match the rig: jog down to the lowest safe point after homing and read the
+# Position actual value off the live readout.
 #
-# Assumes downward travel DECREASES the position count (home = top, down =
-# negative velocity), so the limit is the lowest (most negative) allowed
-# position and travel is blocked once position <= LIFT_DOWN_POSITION_LIMIT.
-# None disables the limit.
+# Assumes downward travel DECREASES the count (home = top, down = negative
+# velocity), so travel is blocked once position <= this. None disables it.
 LIFT_DOWN_POSITION_LIMIT = -120000
 
 # _walk_to_operation_enabled() steps the CiA-402 state machine one confirmed
 # transition at a time. The timeout must cover the lift's automatic brake
 # sequences, which gate those transitions (manual 7.3.3 / 2038h, all four times
-# default 1000 ms): a still-running brake CLOSE from a preceding stop
-# (2038h:1h + :2h) makes the drive refuse the power-up transition until it
-# finishes, and Operation enabled is only reported after the brake OPEN
-# sequence (2038h:3h + :4h). Worst case close + open is ~4 s at defaults; the
-# cart (no brake) lands in a few cycles and never comes near this. Bounded so
-# a stuck drive can't hang the request thread.
+# default 1000 ms): a still-running brake CLOSE from a preceding stop (2038h:1h
+# + :2h) makes the drive refuse the power-up transition, and Operation enabled
+# is only reported after the brake OPEN sequence (2038h:3h + :4h). Worst case
+# close + open is ~4 s at defaults; the cart (no brake) lands in a few cycles.
+# Bounded so a stuck drive can't hang the request thread.
 ENABLE_TIMEOUT_S = 5.0
 ENABLE_POLL_S = 0.01
 
@@ -415,11 +375,10 @@ ANALOG_INPUT_MIN = 0
 ANALOG_INPUT_MAX = 1023
 ANALOG_INPUT_JUMP_THRESHOLD = 512
 
-# Live readout objects, shown in the UI. (key, index, sub, bits, signed, label,
-# fmt) where fmt is None (plain), "hex", "statusword" or "controlword" -- the
-# last two are decoded into their CiA 402 state-machine names (see app.js)
-# instead of a raw value. Mirrors test_controllers.py's READ_OBJECTS plus the
-# analog input.
+# Live readout objects shown in the UI: (key, index, sub, bits, signed, label,
+# fmt), where fmt picks the UI's decoder -- None (plain value), "statusword",
+# "controlword", "endstops" or "brake" (see app.js). Mirrors
+# test_controllers.py's READ_OBJECTS plus the analog input.
 READOUT_SPECS = [
     ("status_word", 0x6041, 0x00, 16, False, "Drive state (6041h)", "statusword"),
     ("position_actual", 0x6064, 0x00, 32, True, "Position actual value (6064h)", None),
@@ -433,9 +392,9 @@ READOUT_SPECS = [
     ("motor_current", 0x2039, 0x05, 32, True, "Actual Current (mA)", None),
 ]
 
-# Per-role readout. The lift has no pendulum sensor, so it drops the analog
-# input row (and skips reading it on the bus). The cart has no brake, so it
-# drops the brake output row; the lift keeps it (its load-holding brake).
+# Per-role readout: the lift has no pendulum sensor, so it drops the analog
+# input row (and skips reading it on the bus); the cart has no brake, so it
+# drops the brake output row that the lift keeps for its load-holding brake.
 READOUT_SPECS_BY_ROLE = {
     "cart": [spec for spec in READOUT_SPECS if spec[0] != "digital_outputs"],
     "lift": [spec for spec in READOUT_SPECS if spec[0] != "analog_input_1"],
@@ -450,25 +409,22 @@ def _to_signed(value, bits):
 
 
 def _quick_stop_active(status_word):
-    """True if statusword (6041h) reports the CiA 402 'Quick stop active'
-    state -- see STATUSWORD_STATE_MASK/STATUSWORD_QUICK_STOP_ACTIVE above."""
+    """True if statusword (6041h) reports CiA 402 'Quick stop active'."""
     if status_word is None:
         return False
     return (status_word & STATUSWORD_STATE_MASK) == STATUSWORD_QUICK_STOP_ACTIVE
 
 
 def _operation_enabled(status_word):
-    """True if statusword (6041h) reports the CiA 402 'Operation enabled'
-    state."""
+    """True if statusword (6041h) reports CiA 402 'Operation enabled'."""
     if status_word is None:
         return False
     return (status_word & STATUSWORD_STATE_MASK) == STATUSWORD_OPERATION_ENABLED
 
 
 def _decode_cia402_state(status_word):
-    """Decode statusword (6041h) into its CiA 402 state-machine state name
-    (mirrors decodeStatusword() in app.js). Returns the raw hex for any word
-    that doesn't match a known state."""
+    """Decode statusword (6041h) into its CiA 402 state name (mirrors
+    decodeStatusword() in app.js); raw hex if it matches no known state."""
     if status_word is None:
         return "unknown"
     sw = status_word & 0xFFFF
@@ -504,25 +460,22 @@ def _decode_cia402_state(status_word):
 #   options  : [{value, label}, ...]           (select only)
 #   min/max/step                                (number/slider)
 #   software : True  -> kept in software, pushed to the drive at mode start
-#   group    : "jog" | "pid" -> which set of controls it belongs to
+#   group    : "jog" | "pid" | "walk" -> which set of controls it belongs to
 #
-# Each controller gets its own schema by role (PARAM_SPECS_BY_ROLE): the cart
-# exposes the jog speed plus the full PID tuning set, the lift exposes only the
-# jog speed (no PID) and with its own speed limits.
+# Each controller gets its own schema by role (PARAM_SPECS_BY_ROLE).
 
-# CiA 402 mode + ramp written whenever a drive is enabled. Both are fixed now
-# (the UI no longer exposes them): Profile Velocity with a jerk-limited ramp,
+# CiA 402 mode + ramp written whenever a drive is enabled. Both fixed now (the
+# UI no longer exposes them): Profile Velocity with a jerk-limited ramp,
 # matching motion_test.py.
 DRIVE_MODE_PROFILE_VELOCITY = 3
 MOTION_PROFILE_JERK_LIMITED = 3
 
-# Manual (joystick) drive parameters. The manual drive is a spring-return
-# one-axis joystick: stick displacement sets the target velocity directly, so
-# jog_speed is the joystick's FULL-SCALE speed (velocity at the ends of travel),
-# not a fixed jog speed. The cart also carries its own acceleration and jerk
-# (applied to the drive when a push engages the ramp). The lift exposes only
-# the full-scale speed -- with its own limit -- leaving its acceleration/jerk to
-# whatever the drive is already configured with.
+# Manual (joystick) drive parameters. The joystick is spring-return and
+# one-axis: displacement sets the target velocity directly, so jog_speed is the
+# FULL-SCALE speed (velocity at the ends of travel), not a fixed jog speed. The
+# cart also carries its own acceleration and jerk (applied when a push engages
+# the ramp); the lift exposes only the full-scale speed -- with its own limit
+# -- leaving accel/jerk to whatever the drive is already configured with.
 JOG_SPECS_CART = [
     {"key": "jog_speed", "label": "Joy max speed (rpm)", "kind": "slider", "group": "jog",
      "default": 700, "min": 50, "max": 700, "step": 10, "software": True},
@@ -538,37 +491,36 @@ JOG_SPECS_LIFT = [
 
 # Walking-mode auto-lower (lift only, see _run_walk_lower). walk_lower_speed is
 # the constant descent speed; walk_touchdown_ma is the |Actual Current|
-# (2039h:05h, mA) below which the payload counts as grounded. Calibrate the
-# threshold from the live readout: note the current while lowering the hanging
-# payload vs. after it has settled on the ground, and pick a value in between.
+# (2039h:05h, mA) below which the payload counts as grounded. Calibrate from
+# the live readout: note the current while lowering the hanging payload vs.
+# after it has settled on the ground, and pick a value in between.
 WALK_SPECS_LIFT = [
     {"key": "walk_lower_speed", "label": "Walk lower speed (rpm)", "kind": "slider", "group": "walk",
      "default": 200, "min": 20, "max": 400, "step": 10, "software": True},
     {"key": "walk_touchdown_ma", "label": "Touchdown current (mA)", "kind": "number", "group": "walk",
      "default": 300, "min": 10, "max": 5000, "step": 10, "software": True},
-    # Max Motor Current (2031h) during the tension phase: high enough to reel
-    # in slack rope against drum/gear friction, low enough that the motor
-    # stalls instead of lifting the grounded payload. Applied at touchdown.
+    # Max Motor Current (2031h) during the tension phase: enough to reel in
+    # slack rope against drum/gear friction, low enough that the motor stalls
+    # instead of lifting the grounded payload. Applied at touchdown.
     {"key": "walk_tension_ma", "label": "Tension current (mA)", "kind": "number", "group": "walk",
      "default": 200, "min": 0, "max": 2000, "step": 10, "software": True},
-    # Fall catch (zero-current phase): trip when the drum accelerates
-    # downwards (negative) faster than this, in rpm of 606Ch per second.
-    # Normal robot walking pays rope out gently; a fall back-drives the drum
-    # with a much steeper ramp. Calibrate against the rig's gearing.
+    # Fall catch (zero-current phase): trip when the drum accelerates downwards
+    # (negative) faster than this, in rpm of 606Ch per second. Normal robot
+    # walking pays rope out gently; a fall back-drives the drum much harder.
+    # Calibrate against the rig's gearing.
     {"key": "walk_catch_accel", "label": "Catch acceleration (rpm/s)", "kind": "number", "group": "walk",
      "default": 500, "min": 50, "max": 10000, "step": 10, "software": True},
-    # 2031h value slammed in when the catch trips -- must be enough torque to
-    # arrest the falling payload; mind the motor's rating, this is written as
-    # the drive's max current limit.
+    # 2031h slammed in when the catch trips -- enough torque to arrest the
+    # falling payload; mind the motor's rating, this is written as the drive's
+    # max current limit.
     {"key": "walk_catch_ma", "label": "Catch current (mA)", "kind": "number", "group": "walk",
      "default": 3500, "min": 100, "max": 6000, "step": 50, "software": True},
 ]
 
 # Software PID balance loop (cart only -- see run_pid_loop / motion_test.py).
 # Every value is kept in software and pushed to the drive when the loop starts
-# (see _apply_motion_profile). The setpoint is not exposed in the UI; it is
-# fixed at PID_SETPOINT below. The gain defaults come straight from
-# motion_test.py.
+# (_apply_motion_profile). The setpoint is fixed at PID_SETPOINT below, not
+# exposed in the UI; the gain defaults come straight from motion_test.py.
 PID_PARAM_SPECS = [
     {"key": "kp", "label": "Kp (rpm / digit)", "kind": "number", "group": "pid",
      "default": -4.5, "min": -50, "max": 50, "step": 0.1, "software": True},
@@ -589,16 +541,16 @@ PID_PARAM_SPECS = [
      "default": 18000, "min": 12000, "max": 200000, "step": 100, "software": True},
 ]
 
-# Per-role parameter schema. The cart carries the PID tuning set; the lift
-# carries the jog speed plus the Walking-mode auto-lower calibration.
+# Per-role parameter schema: the cart carries the PID tuning set, the lift the
+# jog speed plus the Walking-mode calibration.
 PARAM_SPECS_BY_ROLE = {
     "cart": JOG_SPECS_CART + PID_PARAM_SPECS,
     "lift": JOG_SPECS_LIFT + WALK_SPECS_LIFT,
 }
 
-# PID loop constants that are not exposed as tunable params (from motion_test.py).
-# Angle the PID loop holds the pendulum at -- the middle of the analog range
-# (rail centre), matching POSITION_SETPOINT in motion_test.py.
+# PID loop constants not exposed as tunable params (from motion_test.py). The
+# setpoint is the middle of the analog range (rail centre), matching
+# POSITION_SETPOINT in motion_test.py.
 PID_SETPOINT = round(ANALOG_INPUT_MAX / 2)
 PID_DERIVATIVE_TAU_S = 0.1
 PID_INTEGRAL_LIMIT = 200
@@ -606,29 +558,27 @@ PID_INTEGRAL_LEAK_RATE = 0.1
 PID_INTERVAL_S = 0.01          # 100 Hz (motion_test.py runs 50 Hz)
 PID_MAX_DT_S = 5 * PID_INTERVAL_S
 
-# Rope-length scaling of the PID error (cart only, toggled by the length_comp
-# param). The analog input measures the rope ANGLE, but what the cart actually
-# has to null is the robot's horizontal offset ~ rope_length * sin(angle): the
-# same angle error is a much larger offset with 3 m of rope paid out than with
-# 1 m. Scaling the (deadzoned) error and the derivative by the current rope
-# length keeps one set of gains consistent across payout lengths instead of
-# going sluggish near the top and twitchy near the bottom.
+# Rope-length scaling of the PID error (cart only, toggled by length_comp). The
+# analog input measures the rope ANGLE, but what the cart has to null is the
+# robot's horizontal offset ~ rope_length * sin(angle): the same angle error is
+# a much larger offset with 3 m of rope out than with 1 m. Scaling the
+# (deadzoned) error and the derivative by the current rope length keeps one set
+# of gains valid across payout lengths, instead of going sluggish near the top
+# and twitchy near the bottom.
 #
 # Rope length comes from the lift's spindle position (6064h): homed at the top
-# end stop = 0 counts, paying out drives it negative (see
-# LIFT_DOWN_POSITION_LIMIT), so payout = -position. Both constants below are in
-# those same counts and are set to match the rig, like the down limit:
+# end stop = 0 counts, paying out drives it negative, so payout = -position.
+# Both constants below are in those counts and are set to match the rig:
 #
 #   PID_ROPE_COUNTS_AT_TOP -- rope already out (spindle to hook) with the lift
 #       parked at home. Measure once: rope length at top / rope per count.
-#   PID_ROPE_REF_PAYOUT    -- the payout at which the current gains were
-#       tuned; the scale is exactly 1.0 there, so existing tuning carries
-#       over unchanged at that height.
+#   PID_ROPE_REF_PAYOUT    -- the payout the current gains were tuned at; the
+#       scale is exactly 1.0 there, so existing tuning carries over unchanged.
 #
-# The scale is clamped to [PID_LENGTH_SCALE_MIN, PID_LENGTH_SCALE_MAX] so a bad
-# lift reading can neither kill the loop gain nor blow it up, and it falls back
-# to 1.0 (the unscaled loop) whenever no trustworthy payout is available --
-# lift missing, not connected, or not homed (see _rope_length_scale).
+# The scale is clamped to [MIN, MAX] so a bad lift reading can neither kill the
+# loop gain nor blow it up, and falls back to 1.0 (the unscaled loop) whenever
+# no trustworthy payout is available -- lift missing, not connected, or not
+# homed (see _rope_length_scale).
 PID_ROPE_COUNTS_AT_TOP = 30000
 PID_ROPE_REF_PAYOUT = 60000
 PID_LENGTH_SCALE_MIN = 0.3
@@ -643,13 +593,12 @@ class RailController:
     """One Nanotec motor controller (cart or lift).
 
     Wraps the connection handle plus a background readout poller, the live
-    parameter set, hold-to-jog manual drive and the optional software PID
-    balance loop. Every nanolib call goes through the shared bus lock, so the
-    poller and the request-thread commands never touch the accessor at once.
+    parameter set, manual joystick drive and the optional software PID balance
+    loop. Every nanolib call goes through the shared bus lock, so the poller
+    and the request-thread commands never touch the accessor at once.
 
-    In simulate mode there is no accessor/handle: reads return values from a
-    small internal physics stub instead, so the UI is fully exercisable
-    without hardware.
+    In simulate mode there is no accessor/handle: reads come from a small
+    internal physics stub, so the UI is fully exercisable without hardware.
     """
 
     def __init__(self, name, serial_suffix, accessor, handle, bus_lock,
@@ -663,8 +612,8 @@ class RailController:
         self._simulate = simulate
         self.connected = simulate or handle is not None
 
-        # Role-specific schemas (cart carries PID; lift is jog-speed-only and
-        # has no analog-angle readout).
+        # Role-specific schemas: the cart carries PID, the lift has no
+        # analog-angle readout.
         self.param_specs = PARAM_SPECS_BY_ROLE[role]
         self.readout_specs = READOUT_SPECS_BY_ROLE[role]
 
@@ -680,23 +629,23 @@ class RailController:
         self._last_analog = None
         self._last_state_name = None        # CiA 402 state, for change logging
 
-        # Cart only: the lift controller, wired in by
-        # ControllerManager after both are up, so the PID loop can scale its
-        # gains by the rope payout (see _rope_length_scale). None on the lift
-        # itself / while the lift is missing -- the scale then stays 1.0.
+        # Cart only: the lift controller, wired in by ControllerManager once
+        # both are up, so the PID loop can scale its gains by the rope payout
+        # (see _rope_length_scale). None on the lift itself / while it is
+        # missing -- the scale then stays 1.0.
         self.length_source = None
 
-        # System-wide operating mode, pushed onto every controller by
-        # ControllerManager.set_mode(). Gates mode-specific behaviour (for
-        # now: the lift's Basic-mode idle auto-stop).
+        # System-wide operating mode, pushed on by
+        # ControllerManager.set_mode(). Gates mode-specific behaviour (for now
+        # the lift's idle auto-stop).
         self.mode = DEFAULT_MODE
         # Monotonic time since when the lift has been enabled but motionless
         # (see _maybe_idle_stop); None while moving / not applicable.
         self._idle_since = None
-        # Walking-mode auto-lower (lift only, see _run_walk_lower). walk_status
-        # is surfaced to the UI: None (inactive), "lowering", "touchdown" or
-        # "aborted". The stop event cancels a running descent; manual drive and
-        # STOP set it too, so the walk thread can never fight another command.
+        # Walking-mode sequence (lift only, see _run_walk_lower). walk_status
+        # is surfaced to the UI; the stop event cancels a running descent, and
+        # manual drive and STOP set it too, so the walk thread can never fight
+        # another command.
         self.walk_status = None
         self._walk_thread = None
         self._walk_stop = threading.Event()
@@ -706,34 +655,34 @@ class RailController:
         self.jog_direction = 0              # -1, 0, +1
         self.pid_running = False
         self.last_error = None
-        # Serialises the moment a manual-drive command is committed --
-        # _apply_jog_velocity and jog_stop -- so the three fields below and the
-        # target-velocity write move together. Without it, joystick updates
+        # Serialises the moment a manual-drive command is committed
+        # (_apply_jog_velocity / jog_stop), so the three fields above and the
+        # target-velocity write move together -- without it, joystick updates
         # arriving on separate handler threads can reach the drive out of order
         # (see jog_velocity). Reentrant because jog_velocity(0) delegates to
         # jog_stop. Lock order is ALWAYS _jog_lock before the bus lock.
         self._jog_lock = threading.RLock()
-        # Manual-drive deadman (see JOG_DEADMAN_TIMEOUT_S). The monotonic time
-        # by which the next joystick update must arrive; None = not armed. Armed
-        # ONLY by a non-zero jog_velocity, and disarmed by every path that takes
+        # Manual-drive deadman (see JOG_DEADMAN_TIMEOUT_S): monotonic time by
+        # which the next joystick update must arrive; None = not armed. Armed
+        # ONLY by a non-zero jog_velocity, disarmed by every path that takes
         # manual drive away again.
         self._jog_deadline = None
         # True once the deadman has fired for the current lease, so a stop that
-        # keeps failing (dead link) retries silently instead of logging at 10 Hz.
+        # keeps failing (dead link) retries silently, not at the poll rate.
         self._jog_deadman_tripped = False
         # Joystick command ordering (see _accept_jog_order): the highest seq
-        # applied, and the UI session it came from. Both None until the first
+        # applied and the UI session it came from, both None until the first
         # seq-stamped command arrives.
         self._jog_seq = None
         self._jog_epoch = None
-        # Lift only: whether homing has been performed. Read once at connect via
-        # check_homing() (statusword bit 12); None until checked / on the cart,
-        # which has no homing. While this is not True, the lift is locked to
-        # UP-only motion (down disabled) until it is homed against the top end
-        # stop -- see jog()/_maybe_home_at_endstop().
+        # Lift only: whether homing has been performed -- read once at connect
+        # via check_homing() (statusword bit 12); None until checked / on the
+        # cart, which has no homing. While not True, the lift is locked to
+        # UP-only motion until homed against the top end stop -- see jog() /
+        # _maybe_home_at_endstop().
         self.homing_complete = None
-        # Lift only: set while the end-stop homing procedure is running in the
-        # background (so the poll thread fires it exactly once).
+        # Lift only: set while end-stop homing runs in the background (so the
+        # poll thread fires it exactly once).
         self.homing_in_progress = False
         self._homing_thread = None
         self._last_homing_attempt = 0.0     # monotonic time of last auto-home
@@ -748,11 +697,11 @@ class RailController:
         # None until the first heartbeat write; surfaced in the UI snapshot.
         self.heartbeat_ok = None
 
-        # Simulation state (only used when self._simulate).
-        # _sim_current_limit mirrors 2031h writes (None = never touched); the
-        # stall model in _simulate_state keys on it. _sim_falling (set via
-        # POST /api/lift/sim_fall) makes gravity back-drive the torqueless
-        # drum so the fall catch is exercisable without hardware.
+        # Simulation state (only used when self._simulate). _sim_current_limit
+        # mirrors 2031h writes (None = never touched) and keys the stall model
+        # in _simulate_state; _sim_falling (POST /api/lift/sim_fall) makes
+        # gravity back-drive the torqueless drum so the fall catch is
+        # exercisable without hardware.
         self._sim_current_limit = None
         self._sim_falling = False
         self._sim_velocity = 0.0
@@ -761,9 +710,9 @@ class RailController:
         self._sim_target_velocity = 0.0
         self._sim_last = time.monotonic()
         # _simulate_state() integrates incrementally (dt since _sim_last) and
-        # is stepped from more than one thread: the poller, and the walk
-        # thread's fast velocity reads (see _read_velocity_rpm). The lock
-        # keeps two concurrent steps from double-counting the same dt.
+        # is stepped from the poller AND the walk thread's fast velocity reads
+        # (see _read_velocity_rpm); the lock keeps two concurrent steps from
+        # double-counting the same dt.
         self._sim_lock = threading.Lock()
 
     # -- lifecycle ---------------------------------------------------------
@@ -774,8 +723,8 @@ class RailController:
         Called BEFORE anything that walks the drive's state machine -- notably
         the lift's check_homing(): if a previous run armed the watchdog and the
         controller was not power-cycled since, the drive is sitting there timed
-        out, writing controlword 0 every NanoJ cycle, and no enable walk can
-        win against that until the heartbeat is beating again."""
+        out, writing controlword 0 every NanoJ cycle, and no enable walk wins
+        against that until the heartbeat is beating again."""
         if self._simulate or not self.connected:
             return
         self._stop_event.clear()
@@ -800,7 +749,7 @@ class RailController:
                 pass
         # The heartbeat keeps beating until AFTER stop_motor(), so the drive
         # stays responsive for the commanded stop; once it ceases, the drives
-        # also stop themselves ~TimeOut later as a backstop.
+        # stop themselves ~TimeOut later as a backstop.
         self._stop_event.set()
         if self._poll_thread is not None:
             self._poll_thread.join(timeout=2)
@@ -822,14 +771,12 @@ class RailController:
     def _read_angle(self):
         """Fresh Analog Input 1 read for the PID loop (one bus round trip).
 
-        The poller snapshot only refreshes every STATE_POLL_INTERVAL_S
-        (10 Hz), so a 100 Hz PID loop fed from it sees each angle sample up
-        to 100 ms late and unchanged for ~9 of 10 iterations -- the D term
-        differentiates a staircase and the loop oscillates. Reading the
-        sensor directly gives every PID iteration a current angle. Goes
-        through the same wrap-around clamp as the poller; on a failed read
-        the clamp returns the last good value (or None if there has never
-        been one), so a transient bus error coasts for a cycle instead of
+        The poller snapshot only refreshes at 10 Hz, so a 100 Hz PID loop fed
+        from it sees each angle sample up to 100 ms late and unchanged for ~9
+        of 10 iterations -- the D term differentiates a staircase and the loop
+        oscillates. Goes through the same wrap-around clamp as the poller; on a
+        failed read the clamp returns the last good value (None if there has
+        never been one), so a transient bus error coasts for a cycle instead of
         kicking the pendulum."""
         if self._simulate:
             return int(self._sim_angle)
@@ -853,18 +800,17 @@ class RailController:
 
     def _heartbeat_loop(self):
         """Write an ever-changing counter to 2400h:01h every
-        HEARTBEAT_INTERVAL_S (see the OD_HEARTBEAT block for the contract).
-        The first write arms the watchdog on the drive; from then on ONLY this
-        thread keeps the drive from stopping itself, so it runs for the whole
-        lifetime of the connection and is never paused.
+        HEARTBEAT_INTERVAL_S (contract in the OD_HEARTBEAT block). The first
+        write arms the watchdog on the drive; from then on ONLY this thread
+        keeps the drive from stopping itself, so it runs for the whole lifetime
+        of the connection and is never paused.
 
-        Paced against a monotonic deadline, not a fixed sleep after each
-        write: the write itself takes a WiFi round trip, and sleeping the full
-        interval on top of that would stretch the effective period toward the
-        drive's timeout. Failures are written straight to the console on state
-        CHANGE only (a dead link would otherwise spam at 40 Hz) and kept out
-        of last_error -- the drive stopping itself is the designed reaction,
-        not an operator-actionable fault."""
+        Paced against a monotonic deadline, not a fixed sleep after each write:
+        the write itself takes a WiFi round trip, and sleeping the full
+        interval on top would stretch the effective period toward the drive's
+        timeout. Failures print on state CHANGE only (a dead link would
+        otherwise spam) and stay out of last_error -- the drive stopping itself
+        is the designed reaction, not an operator-actionable fault."""
         next_beat = time.monotonic()
         while not self._stop_event.is_set():
             self._heartbeat_value = self._heartbeat_value % HEARTBEAT_MAX + 1
@@ -917,22 +863,21 @@ class RailController:
         Both flags are written by the command paths, but the drive also leaves
         'Operation enabled' on its OWN: a triggered end stop quick-stops it,
         the connection watchdog halts it, a fault drops it out. Nothing here
-        commanded those transitions, so without this the flags stay stuck at
-        whatever the last command left behind -- and every consumer is then
-        wrong:
+        commanded that, so without this the flags stay stuck at whatever the
+        last command left behind -- and every consumer is then wrong:
 
           * the UI keeps showing the drive as enabled;
-          * a joystick update in the same direction skips its enable walk (the
-            lazy engagement in jog_velocity) and just writes target velocities
-            into a drive that is ignoring them -- the stick looks dead until
-            the operator crosses zero;
+          * a same-direction joystick update skips its enable walk (the lazy
+            engagement in jog_velocity) and writes target velocities into a drive
+            that is ignoring them -- the stick looks dead until the operator
+            crosses zero;
           * the lift's idle auto-stop keeps counting a stale jog_direction as
             "still being driven" and never times out (see _maybe_idle_stop).
 
         Only ever CLEARS, and only what a command path had confirmed: the
-        enable paths set drive_enabled themselves once their state-machine walk
-        has landed, and a drive glimpsed mid-walk (brake-release sequence still
-        running) must not be reported as ready from here."""
+        enable paths set drive_enabled themselves once their walk has landed,
+        and a drive glimpsed mid-walk (brake-release sequence still running)
+        must not be reported as ready from here."""
         if self.drive_enabled and not _operation_enabled(snapshot.get("status_word")):
             self.drive_enabled = False
             self.jog_direction = 0
@@ -940,13 +885,12 @@ class RailController:
 
     def set_mode(self, mode):
         """Apply the system-wide operating mode to this controller. The idle
-        timer restarts so a mode switch always grants a fresh
+        timer restarts, so a mode switch always grants a fresh
         LIFT_IDLE_STOP_TIMEOUT_S window.
 
         Lift only: entering Walking starts the auto-lower (the lift DRIVES
-        DOWN, if homed -- see start_walk_lower); leaving Walking cancels a
-        descent still in progress (the walk thread stops the motor, brake
-        closed)."""
+        DOWN, if homed -- see start_walk_lower); leaving it cancels a descent
+        still in progress (the walk thread stops the motor, brake closed)."""
         previous, self.mode = self.mode, mode
         self._idle_since = None
         if self.role != "lift" or mode == previous:
@@ -960,9 +904,9 @@ class RailController:
     def _maybe_idle_stop(self, snapshot):
         """Basic mode, lift only: stop the drive like the STOP button does
         (brake closed) after LIFT_IDLE_STOP_TIMEOUT_S with no up or down
-        movement. 'Movement' is either a commanded jog direction or an actual
-        velocity (606Ch) above the standstill threshold, so a joystick that is
-        still driving the lift somewhere keeps the timer at bay.
+        movement -- 'movement' being a commanded jog direction or an actual
+        velocity (606Ch) above the standstill threshold, so a joystick still
+        driving the lift somewhere keeps the timer at bay.
 
         Armed off the drive state the poller just READ -- not the cached
         drive_enabled flag -- and for every state in which the drive is still
@@ -970,20 +914,14 @@ class RailController:
 
           * 'Operation enabled': brake open, load on motor current. The case
             this watchdog exists for.
-          * 'Quick stop active': where a triggered end stop leaves the lift.
-            The drive braked itself on the way in, but it stays energized and
-            holding, and nothing in this process commanded that transition --
-            so the cached flag still read "enabled" while the state machine had
-            already moved on. Keying on the flag meant the watchdog fired once,
-            wrote a controlword the drive does not accept in that state (see
-            stop_motor), latched drive_enabled = False on the way out and never
-            armed again: hitting the end stop switched the idle stop off.
+          * 'Quick stop active': where a triggered end stop leaves the lift --
+            braked on the way in, but still energized and holding. Nothing here
+            commanded that transition, so keying on the cached flag instead used
+            to switch the idle stop off for good on hitting an end stop.
 
         An unreadable statusword holds the timer where it is rather than
-        restarting it, so a flaky read cannot keep postponing the stop.
-
-        Never fires during homing, whose enable must not be yanked away
-        mid-procedure."""
+        restarting it, so a flaky read cannot keep postponing the stop. Never
+        fires during homing, whose enable must not be yanked mid-procedure."""
         if (self.role != "lift" or self.mode != MODE_BASIC
                 or self.homing_in_progress):
             self._idle_since = None
@@ -1009,9 +947,9 @@ class RailController:
               f"({_decode_cia402_state(status_word)}) -- auto-stop "
               f"(brake closed)")
         if not self.stop_motor():
-            # Say so on the console as well: the line above must not be the
-            # last word if the payload is in fact still on motor current. The
-            # timer restarts, so the next window retries.
+            # Say so on the console too: the line above must not be the last
+            # word if the payload is in fact still on motor current. The timer
+            # restarts, so the next window retries.
             print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
                   f"auto-stop FAILED -- {self.last_error}")
 
@@ -1021,15 +959,15 @@ class RailController:
         JOG_DEADMAN_TIMEOUT_S for what that covers and why.
 
         Guarded on jog_direction as well as the deadline, so every path that
-        takes manual drive away (STOP, a quick stop the drive did itself and
-        _sync_drive_flags noticed, leaving Homing mode, the Walking-mode
-        descent) implicitly disarms this -- the deadman only ever acts on a
-        manual drive command that is still standing.
+        takes manual drive away (STOP, a quick stop _sync_drive_flags noticed,
+        leaving Homing mode, the Walking-mode descent) implicitly disarms this
+        -- the deadman only ever acts on a manual command that is still
+        standing.
 
-        A failed stop write pushes the deadline out by one poll cycle instead of
-        disarming: a single dropped Modbus write must not be the thing that
-        leaves the axis running. Only the first attempt logs, so a dead link
-        retries quietly rather than at the poll rate."""
+        A failed stop write pushes the deadline out by one poll cycle instead
+        of disarming: a single dropped Modbus write must not be what leaves the
+        axis running. Only the first attempt logs, so a dead link retries
+        quietly rather than at the poll rate."""
         if (self._jog_deadline is None or self.jog_direction == 0
                 or time.monotonic() < self._jog_deadline):
             return
@@ -1052,8 +990,8 @@ class RailController:
 
     def _read_max_current(self):
         """Max Motor Current (2031h, mA, unsigned) as currently set on the
-        drive -- read before the tension phase lowers it, so it can be
-        restored. None on read error."""
+        drive -- read before the tension phase lowers it so it can be restored.
+        None on read error."""
         if self._simulate:
             return SIM_MAX_CURRENT_MA
         return self._read(OD_MAX_MOTOR_CURRENT)
@@ -1069,14 +1007,14 @@ class RailController:
     def _sim_current(self):
         """Simulated Actual Current (mA), velocity-proportional. Lift only:
         below SIM_GROUND_POSITION the payload rests on the fake ground, the
-        rope is slack, and only a small friction term remains -- that drop is
+        rope is slack and only a small friction term remains -- that drop is
         what the touchdown detector keys on."""
         grounded = (self.role == "lift"
                     and self._sim_position <= SIM_GROUND_POSITION)
         return int(self._sim_velocity * (0.2 if grounded else 2.0))
 
     def _read_current(self):
-        """Fresh Actual Current (2039h:05h, mA, signed) read for the touchdown
+        """Fresh Actual Current (2039h:05h, mA, signed) for the touchdown
         detector -- like _read_angle, the 10 Hz poller snapshot is too stale to
         feed a detection loop. None on read error."""
         if self._simulate:
@@ -1085,11 +1023,11 @@ class RailController:
         return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
 
     def _cancel_walk(self, wait=True):
-        """Cancel a running auto-lower. Sets the stop event (the walk thread
-        stops the motor and exits within a poll interval) and, when called from
-        another thread with wait=True, joins it -- so a manual jog issued during
-        a descent provably has the walk thread out of the way before it starts
-        commanding velocities of its own."""
+        """Cancel a running auto-lower: set the stop event (the walk thread
+        stops the motor and exits within a poll interval) and, with wait=True
+        from another thread, join it -- so a manual jog issued during a descent
+        provably has the walk thread out of the way before commanding
+        velocities of its own."""
         self._walk_stop.set()
         thread = self._walk_thread
         if (wait and thread is not None and thread.is_alive()
@@ -1098,10 +1036,10 @@ class RailController:
 
     def start_walk_lower(self):
         """Lift only: start the Walking-mode sequence in the background --
-        lower until the motor current says the payload has grounded, then
-        hold rope tension at limited current (see _run_walk_lower). Requires
-        the lift to be homed (the soft down limit is the abort backstop and
-        is home-relative). Returns (ok, message)."""
+        lower until the motor current says the payload has grounded, then hold
+        rope tension at limited current (see _run_walk_lower). Requires the
+        lift to be homed (the soft down limit is the abort backstop and is
+        home-relative). Returns (ok, message)."""
         if self.role != "lift":
             return False, "auto-lower is lift-only"
         if not self.homing_complete:
@@ -1113,8 +1051,9 @@ class RailController:
         self._cancel_walk()               # serialise with a previous descent
         self._walk_stop.clear()
         # Drop any manual-drive lease before the walk thread starts driving:
-        # the descent sets jog_direction itself, and a deadline left over from a
-        # jog moments ago would otherwise expire into the descent and stop it.
+        # the descent sets jog_direction itself, and a deadline left over from
+        # a jog moments ago would otherwise expire into the descent and stop
+        # it.
         self._jog_deadline = None
         self.walk_status = "lowering"
         self.last_error = None
@@ -1125,11 +1064,11 @@ class RailController:
 
     def rearm_walk(self):
         """Operator re-arm (the 'Re-arm walk' button): re-run the Walking-mode
-        sequence after a fall catch, an abort, or a manual override -- e.g.
-        once the robot has recovered and is standing again. Refused while a
-        sequence phase is actively running (STOP is the take-over control
-        there) and outside Walking mode. start_walk_lower() re-checks homing
-        and cleans up any leftover state (2031h restore) itself."""
+        sequence after a fall catch, an abort or a manual override -- e.g. once
+        the robot has recovered and is standing again. Refused while a phase is
+        actively running (STOP is the take-over control there) and outside
+        Walking mode. start_walk_lower() re-checks homing and cleans up any
+        leftover state (2031h restore) itself."""
         if self.role != "lift":
             return False, "walk re-arm is lift-only"
         if self.mode != MODE_WALKING:
@@ -1150,9 +1089,9 @@ class RailController:
 
     def _walk_cancelled(self, expected_direction):
         """True when the walk sequence must exit QUIETLY (no abort status):
-        cancelled via the stop event or a mode switch, or overridden
-        externally -- STOP and manual jog either disable the drive or change
-        jog_direction away from what this thread commanded."""
+        cancelled via the stop event or a mode switch, or overridden externally
+        -- STOP and manual jog either disable the drive or change jog_direction
+        away from what this thread commanded."""
         return (self._walk_stop.is_set() or self.mode != MODE_WALKING
                 or self.jog_direction != expected_direction
                 or not self.drive_enabled)
@@ -1168,53 +1107,47 @@ class RailController:
     def _run_walk_lower(self):
         """Walking mode: lower until touchdown, then hold rope tension.
 
-        Phase 1 -- LOWERING ("lowering"): drive down at walk_lower_speed
-        (plain Profile Velocity, the lift's configured ramp) watching a fresh
-        Actual Current (2039h:05h) read each WALK_POLL_INTERVAL_S. While the
-        payload hangs on the rope the motor carries its load; when it
-        grounds, the load transfers off the rope and |current| drops below
-        walk_touchdown_ma. The detector is armed only once |606Ch| has
-        reached WALK_ARM_VELOCITY_FRACTION of the commanded speed (the ramp's
-        current transients would false-trigger) and needs
-        WALK_TOUCHDOWN_SAMPLES consecutive below-threshold samples; the
-        threshold is re-read from params every iteration for live tuning.
+        Phase 1 -- LOWERING ("lowering"): drive down at walk_lower_speed (plain
+        Profile Velocity, the lift's configured ramp) watching a fresh Actual
+        Current (2039h:05h) read each WALK_POLL_INTERVAL_S. While the payload
+        hangs on the rope the motor carries its load; when it grounds, the load
+        transfers off the rope and |current| drops below walk_touchdown_ma.
+        Armed only once |606Ch| has reached WALK_ARM_VELOCITY_FRACTION of the
+        commanded speed (the ramp's current transients would false-trigger),
+        and needs WALK_TOUCHDOWN_SAMPLES consecutive below-threshold samples;
+        the threshold is re-read from params every iteration for live tuning.
 
-        Phase 2 -- TENSION ("tensioning"): on touchdown the drive STAYS in
-        Operation enabled / Profile Velocity -- no stop, brake stays open.
-        Max Motor Current (2031h) is lowered to walk_tension_ma, then the
-        target velocity is reversed to +walk_lower_speed: the
-        current-clamped motor reels in slack rope but stalls against the
-        grounded payload's weight, holding the rope at tension current.
+        Phase 2 -- TENSION ("tensioning"): the drive STAYS in Operation enabled
+        / Profile Velocity -- no stop, brake stays open. Max Motor Current
+        (2031h) is lowered to walk_tension_ma, then the target velocity is
+        reversed to +walk_lower_speed: the current-clamped motor reels in slack
+        rope but stalls against the grounded payload's weight, holding the rope
+        at tension current.
 
-        Phase 3 -- ZERO CURRENT + FALL WATCH ("grounded" -> "caught"): once
-        the reel-in has stalled (|606Ch| at standstill for
-        WALK_STALL_SAMPLES, armed by upward motion or
-        WALK_TENSION_ARM_TIMEOUT_S), the target velocity is zeroed and
-        2031h is set to 0: no torque at all, mode and enable state
-        untouched. The thread then differentiates fresh 606Ch reads -- taken
-        every WALK_CATCH_POLL_INTERVAL_S, faster than the other phases,
-        because detection latency here is fall distance: the
-        torqueless drum follows the payload, so normal walking pays rope out
-        gently (negative, downwards) while a fall back-drives it with a
-        steep negative ramp. Acceleration <= -walk_catch_accel for
-        WALK_CATCH_SAMPLES consecutive pairs -> 2031h = walk_catch_ma: with
-        the target already at 0, the drive arrests the fall and HOLDS at
-        zero velocity until the operator takes over (STOP / joystick / mode
+        Phase 3 -- ZERO CURRENT + FALL WATCH ("grounded" -> "caught"): once the
+        reel-in has stalled (|606Ch| at standstill for WALK_STALL_SAMPLES,
+        armed by upward motion or WALK_TENSION_ARM_TIMEOUT_S), the target
+        velocity is zeroed and 2031h set to 0: no torque at all, mode and
+        enable state untouched. The thread then differentiates fresh 606Ch
+        reads every WALK_CATCH_POLL_INTERVAL_S -- faster than the other phases,
+        because detection latency here is fall distance. Acceleration <=
+        -walk_catch_accel for WALK_CATCH_SAMPLES consecutive pairs -> 2031h =
+        walk_catch_ma: with the target already at 0, the drive arrests the fall
+        and HOLDS until the operator takes over (STOP / joystick / mode
         switch); the positive end stop / drive-state aborts stay armed.
 
-        The original 2031h value is read up front and restored in the finally
-        on EVERY exit after it was touched -- always after the motion has been
-        stopped or handed over, never while this thread's upward command is
-        still active (full current + commanded up-velocity would hoist the
-        payload). A 2031h reading 0 at start (a killed run left it there)
-        refuses to start: power-cycle the controller to get the saved value
-        back.
+        The original 2031h is read up front and restored in the finally on
+        EVERY exit after it was touched -- always after the motion has been
+        stopped or handed over, never while this thread's upward command still
+        stands (full current + up-velocity would hoist the payload). A 2031h
+        reading 0 at start (a killed run left it there) refuses to start:
+        power-cycle the controller to get the saved value back.
 
-        Aborts (stop, brake closed, 2031h restored): soft down limit / neg
+        Aborts (stop, brake closed, 2031h restored): soft down limit / negative
         end stop / WALK_LOWER_TIMEOUT_S during the descent; positive end stop
         or the drive leaving Operation enabled during tension. Exits QUIETLY,
-        without re-stopping, when someone else took over (STOP / manual jog /
-        mode switch) -- see _walk_cancelled/_walk_exit_quietly."""
+        without re-stopping, when someone else took over -- see _walk_cancelled
+        / _walk_exit_quietly."""
         params = self.get_params()
         speed = int(params.get("walk_lower_speed", 0))
         if speed <= 0:
@@ -1278,8 +1211,8 @@ class RailController:
                 self._walk_stop.wait(WALK_POLL_INTERVAL_S)
 
             # --- phase 2: tension -- reel in slack at limited current -----
-            # Order matters: clamp 2031h BEFORE reversing the velocity, so
-            # the up-command can never run at full current.
+            # Order matters: clamp 2031h BEFORE reversing the velocity, so the
+            # up-command can never run at full current.
             tension_ma = int(self.get_params().get("walk_tension_ma", 0))
             current_modified = True
             if not self._set_max_current(tension_ma):
@@ -1331,10 +1264,10 @@ class RailController:
                 self._walk_stop.wait(WALK_POLL_INTERVAL_S)
 
             # --- phase 3: stalled taut -- zero current + fall watch --------
-            # Zero the velocity command along with the current: the drive
-            # stays in Operation enabled, but when the fall catch restores
-            # torque, the target is already 0 -- it arrests the fall and
-            # HOLDS instead of reeling up at the tension phase's up-command.
+            # Zero the velocity command along with the current: the drive stays
+            # enabled, but when the catch restores torque the target is already
+            # 0 -- it arrests the fall and HOLDS instead of reeling up at the
+            # tension phase's up-command.
             if not self.set_target_velocity(0):
                 self._walk_abort(self.last_error or "could not zero the "
                                  "velocity command after stall")
@@ -1347,13 +1280,13 @@ class RailController:
                   f"rope taut (stalled) -- 2031h = 0 mA, target velocity 0, "
                   f"Operation enabled kept; fall watch armed")
 
-            # Differentiate consecutive fresh 606Ch reads. The torqueless
-            # drum follows the payload: gentle negative pay-out is the robot
+            # Differentiate consecutive fresh 606Ch reads. The torqueless drum
+            # follows the payload: gentle negative pay-out is the robot
             # walking; acceleration at or below -walk_catch_accel for
             # WALK_CATCH_SAMPLES consecutive pairs is a fall. A failed read
-            # skips the pair (neither counts nor resets). Paced at the fast
-            # WALK_CATCH_POLL_INTERVAL_S: only the velocity read touches the
-            # bus, the drive-state check reads the cached poller snapshot.
+            # skips the pair (neither counts nor resets). Only the velocity
+            # read touches the bus -- the drive-state check uses the cached
+            # poller snapshot.
             last_velocity = None
             last_time = None
             rapid = 0
@@ -1413,8 +1346,8 @@ class RailController:
                 self._walk_stop.wait(WALK_POLL_INTERVAL_S)
         finally:
             # Always leave the drive with its real current limit -- but only
-            # once motion is stopped / handed over (every path above stops or
-            # yields before reaching here).
+            # once motion is stopped / handed over (every path above does so
+            # first).
             if current_modified:
                 if self._set_max_current(original_ma):
                     print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} "
@@ -1428,10 +1361,9 @@ class RailController:
                           f"walk: {self.last_error}")
 
     def _log_state_change(self, status_word):
-        """Print a line to the terminal whenever this controller's CiA 402 state
-        machine (decoded from statusword 6041h) changes -- the first observed
-        state is logged too. Runs for both the cart and the lift (each poll
-        thread tracks its own last state)."""
+        """Print a line whenever this controller's CiA 402 state (decoded from
+        statusword 6041h) changes; the first observed state is logged too. Runs
+        for both controllers, each poll thread tracking its own last state."""
         if status_word is None:
             return
         state_name = _decode_cia402_state(status_word)
@@ -1443,10 +1375,10 @@ class RailController:
               f"{arrow}{state_name} (0x{status_word & 0xFFFF:04X})")
 
     def _enforce_down_limit(self, snapshot):
-        """Lift only: soft lower travel limit. If the lift is moving down and has
-        reached LIFT_DOWN_POSITION_LIMIT, command a stop so it can't run past the
-        bottom of its travel. This has to catch it live because a held joystick
-        keeps a steady down velocity with no further commands to gate."""
+        """Lift only: soft lower travel limit. If the lift is moving down and
+        has reached LIFT_DOWN_POSITION_LIMIT, command a stop. This has to catch
+        it live because a held joystick keeps a steady down velocity with no
+        further commands to gate."""
         if self.jog_direction >= 0:
             return
         if self._down_position_blocked(snapshot.get("position_actual")):
@@ -1455,13 +1387,13 @@ class RailController:
 
     def _maybe_home_at_endstop(self, snapshot):
         """Lift only: while the lift is not yet homed, watch for it resting on
-        the top end stop and, when it is, kick off the end-stop homing procedure
-        (method 35) in the background.
+        the top end stop and kick off end-stop homing (method 35) in the
+        background.
 
-        This covers the lift that was NOT on the end stop when the script
-        started: check_homing() left it unhomed and UP-only, and the operator has
-        now driven it up into the stop. A lift already parked on the stop at
-        startup is homed by check_homing() itself and never reaches here.
+        Covers the lift that was NOT on the end stop at startup: check_homing()
+        left it unhomed and UP-only, and the operator has now driven it up into
+        the stop. A lift already parked there is homed by check_homing()
+        itself.
 
         See _resting_on_endstop() for what counts as resting on the stop.
         homing_in_progress guards re-entry; the retry interval keeps a
@@ -1527,20 +1459,20 @@ class RailController:
             return dict(self.params)
 
     def set_param(self, key, value):
-        """Validate + store a parameter. All params are software: the value is
-        pushed to the drive when its mode starts (jog / PID apply their own
+        """Validate + store a parameter. All params live in software: the value
+        is pushed to the drive when its mode starts (jog / PID apply their own
         speed / accel / jerk). Returns (ok, message)."""
         spec = next((s for s in self.param_specs if s["key"] == key), None)
         if spec is None:
             return False, f"unknown parameter '{key}'"
 
-        # Coerce to the appropriate type (only the PID gains are floats).
+        # Coerce to the right type (only the PID gains are floats).
         try:
             value = float(value) if key in ("kp", "ki", "kd") else int(round(float(value)))
         except (TypeError, ValueError):
             return False, f"invalid value for '{key}': {value!r}"
 
-        # Range check.
+        # Clamp into range.
         if "min" in spec and value < spec["min"]:
             value = spec["min"]
         if "max" in spec and value > spec["max"]:
@@ -1553,10 +1485,10 @@ class RailController:
     # -- drive: shared Profile Velocity primitives (from motion_test.py) ---
 
     def _apply_motion_profile(self, accel, jerk):
-        """Write 6083h/6084h (accel/decel) and all four 60A4h (jerk) subindices.
+        """Write 6083h/6084h (accel/decel) and all four 60A4h jerk subindices.
         Called at the start of a cart jog or the PID loop so each ramps with
-        its OWN acceleration/jerk. The lift jog has no accel/jerk params, so it
-        skips this and leaves the drive's configured ramp untouched."""
+        its OWN accel/jerk. The lift jog has no such params and skips this,
+        leaving the drive's configured ramp untouched."""
         if self._simulate:
             return True
         self._write(OD_PROFILE_ACCELERATION, accel)
@@ -1567,16 +1499,16 @@ class RailController:
 
     def enable_drive(self):
         """Select Profile Velocity mode with a jerk-limited ramp and walk the
-        CiA 402 state machine to 'Operation enabled' (one confirmed transition
-        at a time -- see _walk_to_operation_enabled). The accel/jerk ramp is
-        applied by the caller (jog / PID), since each has its own values.
+        CiA 402 state machine to 'Operation enabled', one confirmed transition
+        at a time (see _walk_to_operation_enabled). The accel/jerk ramp is
+        applied by the caller (jog / PID), which each have their own values.
         Sets last_error (with the stuck state) on failure."""
         if self._simulate:
             self.drive_enabled = True
             return True
-        # Keep the NanoJ connection watchdog running (see OD_HEARTBEAT).
-        # This used to STOP the NanoJ program -- that would disarm the
-        # watchdog on every enable.
+        # Keep the NanoJ connection watchdog running (see OD_HEARTBEAT) -- this
+        # used to STOP the NanoJ program, disarming the watchdog on every
+        # enable.
         self._write(OD_NANOJ_CONTROL, 1)
         self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
         self._write(OD_MOTION_PROFILE_TYPE, MOTION_PROFILE_JERK_LIMITED)
@@ -1587,10 +1519,10 @@ class RailController:
             self.last_error = ("drive did not reach Operation enabled "
                                f"(stuck in {_decode_cia402_state(status_word)})")
             return False
-        # Confirm Profile Velocity is actually running (6061h). The 6060h write
-        # above is refused if the drive was still in 'Quick stop active' at that
-        # moment (mode changes don't take there); now that the walk has it
-        # enabled, re-select and wait if the display disagrees.
+        # Confirm Profile Velocity is actually running (6061h): the 6060h write
+        # above is refused if the drive was still in 'Quick stop active' then,
+        # so now that the walk has it enabled, re-select and wait if the
+        # display disagrees.
         if self._read(OD_MODE_OF_OPERATION_DISPLAY) != DRIVE_MODE_PROFILE_VELOCITY:
             self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
             if not self._wait_for_mode(DRIVE_MODE_PROFILE_VELOCITY):
@@ -1601,40 +1533,36 @@ class RailController:
 
     def _walk_to_operation_enabled(self):
         """Walk the CiA-402 state machine to 'Operation enabled' one CONFIRMED
-        transition at a time: read the statusword, issue exactly the controlword
-        the observed state calls for, and repeat until the drive reports
-        Operation enabled or ENABLE_TIMEOUT_S runs out. Returns the last
-        statusword read. Commands no motion: target velocity is held at 0 by the
-        callers and controlword bit 4 stays low.
+        transition at a time: read the statusword, issue exactly the
+        controlword the observed state calls for, repeat until the drive
+        reports Operation enabled or ENABLE_TIMEOUT_S runs out. Returns the
+        last statusword read. Commands no motion (callers hold target velocity
+        at 0 and controlword bit 4 stays low).
 
-        Pacing by the OBSERVED state (not firing 0x06 -> 0x07 -> 0x0F blind) is
-        what makes this coexist with the drive's automatic brake control, whose
-        timed sequences gate the transitions (manual 7.3.3 / 2038h):
-
-          * after a stop, the drive spends 2038h:1h + :2h finishing its
-            brake-close sequence, during which it refuses the next power-up
-            transition. A blind sequence is swallowed there -- the drive sticks
-            below Operation enabled with the brake closed and the motor current
-            already on. Here the pending command is simply re-issued each cycle
-            until the drive takes it (same lesson as the old end-stop recovery:
-            commands sent while the drive is busy are consumed without effect).
-          * the final Switched on -> Operation enabled step is the ONE
-            transition that runs the brake-release sequence, and Operation
-            enabled is only reported after it completes (2038h:3h + :4h) -- so
-            the brake is provably open as soon as this returns enabled.
+        Pacing by the OBSERVED state, rather than firing 0x06 -> 0x07 -> 0x0F
+        blind, is what makes this coexist with the drive's automatic brake
+        control, whose timed sequences gate the transitions (manual 7.3.3 /
+        2038h): after a stop the drive is still finishing its brake-close
+        sequence and refuses the next power-up transition, swallowing a blind
+        sequence and sticking below Operation enabled with the motor current
+        already on. Here the pending command is simply re-issued each cycle
+        until the drive takes it. The final Switched on -> Operation enabled
+        step is also the ONE transition that runs the brake-release sequence,
+        and enabled is only reported once that completes -- so the brake is
+        provably open as soon as this returns enabled.
 
         'Quick stop active' (a triggered end stop) is recovered per role:
 
           * cart (no brake): controlword bit-2 edge -- force the quick-stop bit
-            low (0x02), then Enable Operation (0x0F) whose rising bit 2 is
-            CiA-402 transition 16. Fastest way back, keeps the drive energized
-            and in control of the axis while it is still decelerating.
+            low (0x02), then Enable Operation (0x0F), whose rising bit 2 is
+            CiA-402 transition 16. Fastest way back, and the drive stays
+            energized and in control of the axis while still decelerating.
           * lift: NEVER transition 16 -- it re-enters Operation enabled without
-            the brake-release sequence, so the drive torques against the closed
-            brake (the brake closed on the way INTO Quick stop active). Instead
-            Disable voltage (0x00, transition 12) down to 'Switch on disabled'
-            and walk back up, so the last step is the brake-releasing
-            transition. The load hangs on the closed brake throughout.
+            the brake-release sequence, so the drive torques against the brake
+            that closed on the way INTO Quick stop active. Instead Disable
+            voltage (0x00, transition 12) down to 'Switch on disabled' and walk
+            back up, so the last step is the brake-releasing one. The load hangs
+            on the closed brake throughout.
 
         Fault / Fault reaction active are deliberately NOT recovered here: a
         fault reset (controlword bit 7) on a loaded axis must be an explicit
@@ -1664,13 +1592,12 @@ class RailController:
 
     def _ensure_operation_enabled(self):
         """Make sure the drive is in 'Operation enabled' before jogging or
-        starting the PID loop: enable_drive() selects Profile Velocity and walks
-        the state machine there from wherever it currently is, including
-        end-stop recovery from 'Quick stop active' (see
-        _walk_to_operation_enabled). Waits for the state to actually land
-        rather than racing a single read ahead of the drive (that race is why
-        jog used to need two clicks); uses fresh statusword reads, never the
-        poller's up-to-STATE_POLL_INTERVAL_S-old snapshot."""
+        starting the PID loop: enable_drive() selects Profile Velocity and
+        walks the state machine there from wherever it is, including end-stop
+        recovery from 'Quick stop active' (see _walk_to_operation_enabled).
+        Waits for the state to actually land rather than racing a single read
+        ahead of the drive (that race is why jog used to need two clicks),
+        using fresh statusword reads rather than the poller's snapshot."""
         if self._simulate:
             self.drive_enabled = True
             return True
@@ -1681,12 +1608,11 @@ class RailController:
 
     def _enable_keep_mode(self):
         """Bring the drive to 'Operation enabled' WITHOUT changing the selected
-        mode of operation -- the mode-preserving sibling of enable_drive(), used
-        by homing (which must stay in Homing mode; enable_drive() would force
-        Profile Velocity). Same confirmed-transition walk, same per-role
+        mode of operation -- the mode-preserving sibling of enable_drive(),
+        used by homing (which must stay in Homing mode; enable_drive() would
+        force Profile Velocity). Same confirmed-transition walk and per-role
         end-stop recovery (see _walk_to_operation_enabled), no mode write.
-        Returns the last statusword; commands no motion (target velocity held
-        at 0, controlword bit 4 = 0)."""
+        Returns the last statusword; commands no motion."""
         self._write(OD_TARGET_VELOCITY, 0)
         # Keep (not stop!) the NanoJ connection watchdog running.
         self._write(OD_NANOJ_CONTROL, 1)
@@ -1696,9 +1622,9 @@ class RailController:
         """Velocity actual value (606Ch) in rpm, signed; None on read error."""
         if self._simulate:
             # Step the sim physics instead of returning the stored value: the
-            # poller only advances it at 10 Hz, and the fall watch samples
-            # faster than that -- differencing a 10 Hz staircase at 50 Hz
-            # reads as zero acceleration and the sim fall would never trip.
+            # poller only advances it at 10 Hz, and differencing a 10 Hz
+            # staircase at the fall watch's 50 Hz reads as zero acceleration --
+            # the sim fall would never trip.
             return self._simulate_state()["velocity_actual"]
         raw = self._read(OD_VELOCITY_ACTUAL)
         return None if raw is None else _to_signed(raw & 0xFFFFFFFF, 32)
@@ -1716,41 +1642,33 @@ class RailController:
         return self._write(OD_TARGET_VELOCITY, int(rpm))
 
     def stop_motor(self):
-        """Command zero velocity and take the drive out of whichever state it is
-        holding the axis in, so the load ends up on the closed brake.
+        """Command zero velocity and take the drive out of whichever state it
+        is holding the axis in, so the load ends up on the closed brake.
 
         Paced by the OBSERVED state, one command per cycle, because the two
         holding states need DIFFERENT commands:
 
-          * 'Operation enabled' -> 0x07 (Disable operation, CiA-402 transition
-            5). 0x07, not 0x06: leaving Operation enabled triggers the
-            automatic brake close sequence either way, but 0x06 (Shutdown)
-            falls through to 'Ready to switch on', one state further down.
-            Stopping at 'Switched on' keeps the power stage up and makes the
-            next enable a SINGLE transition -- the one the automatic brake
-            control releases the brake on (manual 7.3.3) -- instead of a
-            multi-step walk interleaving with the still-running brake close
-            sequence.
-          * 'Quick stop active' (a triggered end stop) -> 0x00 (Disable
-            voltage, transition 12, landing in 'Switch on disabled'). This
-            state has NO transition on 0x07: CiA-402 leaves it only via Disable
-            voltage or, with quick stop option code 5/6/7, Enable operation
-            (0x0F, transition 16). Firing the old unconditional 0x07 here was
-            silently swallowed -- the drive stayed energized and holding while
-            this reported a successful stop, because the confirm loop below
-            only ever waited for 'Operation enabled' to clear and that had
-            already happened when the end stop hit. Transition 16 is never an
-            option: see _walk_to_operation_enabled on why the lift must not
-            re-enter Operation enabled without the brake-release sequence.
+          * 'Operation enabled' -> 0x07 (Disable operation, transition 5). 0x07,
+            not 0x06: either way the automatic brake close runs, but 0x06
+            (Shutdown) falls through to 'Ready to switch on', one state further
+            down. Stopping at 'Switched on' keeps the power stage up and makes
+            the next enable a SINGLE transition -- the one the brake is released
+            on (manual 7.3.3) -- instead of a multi-step walk interleaving with
+            the still-running brake close.
+          * 'Quick stop active' (a triggered end stop) -> 0x00 (Disable voltage,
+            transition 12, landing in 'Switch on disabled'). This state has NO
+            transition on 0x07: CiA-402 leaves it only via Disable voltage or,
+            with quick stop option code 5/6/7, Enable operation (transition 16,
+            never an option here -- see _walk_to_operation_enabled). An
+            unconditional 0x07 is silently swallowed, leaving the drive
+            energized and holding while this reports a successful stop.
 
         Re-issuing each cycle rather than commanding once and watching: a drive
-        busy with a brake sequence consumes commands without effect (same
-        lesson as _walk_to_operation_enabled).
-
-        Confirming the state actually left the holding states also keeps an
-        immediately following jog from reading a stale 'Operation enabled',
-        skipping its enable walk and writing a target velocity that the
-        still-running disable then discards -- a jog press that does nothing."""
+        busy with a brake sequence consumes commands without effect. Confirming
+        the state actually left the holding states also keeps an immediately
+        following jog from reading a stale 'Operation enabled', skipping its
+        enable walk and writing a target velocity the still-running disable
+        discards -- a jog press that does nothing."""
         # A STOP overrides a running auto-lower: flag it so the walk thread
         # exits instead of re-commanding its descent velocity. No join here --
         # the walk thread itself calls stop_motor() on touchdown/abort.
@@ -1778,10 +1696,9 @@ class RailController:
             else:
                 break           # no longer holding: the load is on the brake
             if time.monotonic() >= deadline:
-                # Still holding the axis: report the failure rather than the
-                # old "the controlword write went out fine" -- callers (the
-                # STOP route, the idle auto-stop) need to know the load did
-                # not end up on the brake.
+                # Still holding the axis: report the failure -- callers (the
+                # STOP route, the idle auto-stop) need to know the load did not
+                # end up on the brake.
                 self.last_error = ("stop commanded but drive still reports "
                                    f"{_decode_cia402_state(status_word)}")
                 ok = False
@@ -1793,11 +1710,10 @@ class RailController:
     # -- manual jog (hold-to-jog) -----------------------------------------
 
     def _down_locked(self, direction):
-        """Lift only: until the lift is homed, downward motion is disabled so the
-        operator can only drive UP into the top end stop to home it. 'Down' is
-        the negative direction (up = +1 for the lift). Sets last_error and
-        returns True when a move should be blocked. The cart, and a homed lift,
-        are never locked."""
+        """Lift only: until the lift is homed, downward motion is disabled so
+        the operator can only drive UP into the top end stop to home it ('down'
+        being the negative direction). Sets last_error and returns True when a
+        move should be blocked; the cart and a homed lift are never locked."""
         if self.role != "lift" or self.homing_complete or direction >= 0:
             return False
         self.last_error = ("lift not homed -- drive UP into the top end stop to "
@@ -1806,10 +1722,10 @@ class RailController:
 
     def _down_position_blocked(self, position=None):
         """Lift only: True if the soft lower travel limit
-        (LIFT_DOWN_POSITION_LIMIT) is configured and the lift has reached it, so
-        downward motion must be blocked/stopped. Only meaningful once homed (the
-        limit is relative to the home reference). Uses the given Position actual
-        value (6064h), or the poller's latest when not supplied."""
+        (LIFT_DOWN_POSITION_LIMIT) is configured and the lift has reached it,
+        so downward motion must be blocked. Only meaningful once homed (the
+        limit is home-relative). Uses the given Position actual value (6064h),
+        or the poller's latest."""
         if (self.role != "lift" or LIFT_DOWN_POSITION_LIMIT is None
                 or not self.homing_complete):
             return False
@@ -1824,13 +1740,13 @@ class RailController:
         direction always stays available so the axis can be driven back off the
         switch.
 
-        A blocked request also RELEASES a jog that was still running in that
-        direction. Refusing it while leaving jog_direction pointing at the
-        blocked direction told the rest of the system the operator was still
-        driving -- which kept the lift's idle auto-stop from ever timing out
-        (see _maybe_idle_stop) while the joystick was held into the end stop --
-        and left the last target velocity standing on the drive, ready to be
-        executed the moment it recovers out of 'Quick stop active'."""
+        A blocked request also RELEASES a jog still running in that direction.
+        Leaving jog_direction pointing at the blocked direction told the rest
+        of the system the operator was still driving -- which kept the lift's
+        idle auto-stop from ever timing out (see _maybe_idle_stop) while the
+        joystick was held into the end stop -- and left the last target
+        velocity standing on the drive, ready to execute the moment it recovers
+        out of 'Quick stop active'."""
         if direction > 0 and state.get("pos_limit"):
             blocked, allowed = "positive", "negative"
         elif direction < 0 and state.get("neg_limit"):
@@ -1844,27 +1760,23 @@ class RailController:
         return True
 
     def jog(self, direction):
-        """Start jogging: direction is -1, 0 or +1. Enables the drive on
-        demand and sets target velocity to +/- the jog_speed param.
-
-        For the LIFT this is the same generic Profile Velocity move; the
-        direction is interpreted as up (+1) / down (-1) by the UI. Real lift
-        travel limits / homing would gate this -- see lift_up/lift_down.
+        """Start jogging: direction is -1, 0 or +1. Enables the drive on demand
+        and sets target velocity to +/- the jog_speed param. For the LIFT it is
+        the same generic Profile Velocity move, the direction read as up (+1) /
+        down (-1) by the UI; real travel limits / homing would gate this -- see
+        lift_up / lift_down.
 
         End stops: a triggered limit switch only blocks the direction that
-        drove into it (positive limit switch -> positive direction, and
-        vice versa, matching the C5-E's own NLS/PLS naming) -- the opposite
-        direction always stays available so the cart can be driven back off
-        the switch. Commanding that opposite direction also recovers the
-        drive out of the 'Quick stop active' state the limit switch forced
-        it into (see _walk_to_operation_enabled), so normal operation resumes
-        as soon as it's commanded.
+        drove into it, so the opposite one always stays available to drive back
+        off the switch -- and commanding it also recovers the drive out of the
+        'Quick stop active' state the switch forced it into (see
+        _walk_to_operation_enabled).
 
         NB unlike jog_velocity this is a LATCHED jog with no deadman: it drives
-        until something stops it. The UI does not use it (the manual drive is the
-        joystick), so it is left as is -- but any client that does must send its
-        own release, and gets no protection if it goes away mid-jog. Route new
-        hold-to-drive callers through jog_velocity instead.
+        until something stops it. The UI does not use it (the manual drive is
+        the joystick), so it is left as is -- but any client that does must
+        send its own release, and gets no protection if it goes away mid-jog.
+        Route new hold-to-drive callers through jog_velocity instead.
         """
         direction = max(-1, min(1, int(direction)))
         if direction == 0:
@@ -1873,7 +1785,7 @@ class RailController:
             return False, "stop the PID loop before jogging"
         # Manual drive overrides a running Walking-mode auto-lower; the join
         # inside guarantees the walk thread has stopped commanding velocities
-        # before this one starts.
+        # first.
         self._cancel_walk()
         if self._down_locked(direction):
             return False, self.last_error
@@ -1887,8 +1799,8 @@ class RailController:
         if not self._ensure_operation_enabled():
             return False, self.last_error or "failed to enable drive"
         p = self.get_params()
-        # The cart ramps with its own jog accel/jerk; the lift has none of
-        # those params and leaves the drive's configured ramp untouched.
+        # The cart ramps with its own jog accel/jerk; the lift has neither and
+        # leaves the drive's configured ramp untouched.
         if "jog_accel" in p and "jog_jerk" in p:
             self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
         if not self.set_target_velocity(direction * p["jog_speed"]):
@@ -1898,38 +1810,30 @@ class RailController:
 
     def jog_velocity(self, velocity, seq=None, epoch=None):
         """Joystick drive: command an arbitrary signed target velocity (rpm),
-        whose magnitude is how far the stick is pushed. 0 releases the stick
-        (ramp to zero, stay enabled) so the next push responds immediately.
-
-        The magnitude is clamped to the configured full-scale joy speed
-        (jog_speed). End-stop and PID gating match jog(): a triggered limit
-        switch only blocks the direction that drove into it.
+        the magnitude being how far the stick is pushed and clamped to the
+        configured full-scale joy speed (jog_speed). 0 releases the stick (ramp
+        to zero, stay enabled) so the next push responds immediately. End-stop
+        and PID gating match jog().
 
         Engagement is lazy: the CiA-402 enable + motion-profile writes only run
         when starting from rest or reversing across zero, so the stream of
-        small updates a dragged stick produces is just a target-velocity write
-        each -- not a full re-enable every time.
+        small updates a dragged stick produces is one target-velocity write
+        each.
 
         A HELD stick is repeated by the UI at JOY_HOLD_INTERVAL_MS (app.js) and
         each non-zero command here extends the deadman lease, so letting go --
         or losing the frontend entirely -- stops the axis within
-        JOG_DEADMAN_TIMEOUT_S even if no stop command ever arrives. See
-        _enforce_jog_deadman.
+        JOG_DEADMAN_TIMEOUT_S even if no stop command ever arrives (see
+        _enforce_jog_deadman).
 
         seq is the UI's per-controller command counter, and it is what makes a
-        release win over an update that was already in flight. Requests arrive
-        on independent handler threads (ThreadingHTTPServer) and only serialise
-        on the Modbus lock, so a drag update posted 1-2 ms before the operator
-        let go could win that lock AFTER the release and leave its velocity
-        standing on the drive -- the "let go and it keeps driving" failure. The
-        seq is therefore checked and recorded under _jog_lock together with the
-        velocity write (see _accept_jog_order / _apply_jog_velocity): an update
-        that lost the race is dropped instead of being applied out of order.
-        Checking it on the way in would not be enough -- both threads could pass
-        the check and still reach their writes in the wrong order.
-
-        epoch identifies the UI session the seq belongs to; see
-        _accept_jog_order for why a bare counter is not enough."""
+        release win over an update already in flight: handler threads only
+        serialise on the Modbus lock, so a drag update posted 1-2 ms before the
+        operator let go could win that lock AFTER the release and leave its
+        velocity standing on the drive -- the "let go and it keeps driving"
+        failure. It is therefore checked and recorded under _jog_lock together
+        with the velocity write, not on the way in (see _accept_jog_order /
+        _apply_jog_velocity). epoch identifies the UI session it belongs to."""
         try:
             velocity = int(round(float(velocity)))
         except (TypeError, ValueError):
@@ -1939,8 +1843,8 @@ class RailController:
         # Manual drive overrides a running Walking-mode auto-lower (see jog()).
         self._cancel_walk()
 
-        # Clamp magnitude to the full-scale joy speed so the stick can never
-        # command more than the configured maximum.
+        # Clamp so the stick can never command more than the configured
+        # maximum.
         limit = int(self.get_params().get("jog_speed", 0))
         velocity = max(-limit, min(limit, velocity))
 
@@ -1957,7 +1861,8 @@ class RailController:
             return False, self.last_error
 
         # Only run the (heavy) enable + ramp setup when engaging from rest or
-        # reversing direction; a same-direction update is just a velocity write.
+        # reversing direction; a same-direction update is just a velocity
+        # write.
         if self.jog_direction != direction:
             if not self._ensure_operation_enabled():
                 return False, self.last_error or "failed to enable drive"
@@ -1970,20 +1875,20 @@ class RailController:
     def _accept_jog_order(self, seq, epoch):
         """Ordering gate for UI joystick commands: True if this one should be
         applied. Call with _jog_lock held -- checking and recording has to be
-        atomic with the velocity write, or two threads both pass and still reach
-        the drive in the wrong order.
+        atomic with the velocity write, or two threads both pass and still
+        reach the drive in the wrong order.
 
         seq only orders commands within one UI SESSION (epoch), because a page
         reload restarts the counter at 1: without the epoch a refreshed page
-        would have every command rejected against the old high-water mark, i.e. a
-        dead joystick. A command from a different epoch takes over and re-bases
-        the counter, so the most recently used tab owns the stick. Two tabs
-        dragging in the same instant would flip-flop epochs and lose the ordering
-        guarantee between them -- degenerate (one operator, one pointer), and no
-        worse than having no seq at all.
+        would have every command rejected against the old high-water mark, i.e.
+        a dead joystick. A command from a different epoch takes over and
+        re-bases the counter, so the most recently used tab owns the stick. Two
+        tabs dragging at once would flip-flop epochs and lose the guarantee
+        between them -- degenerate, and no worse than having no seq at all.
 
-        Commands with no seq -- curl, an older cached UI, and every internal stop
-        (end stop, travel limit, the deadman itself) -- are always applied."""
+        Commands with no seq -- curl, an older cached UI, and every internal
+        stop (end stop, travel limit, the deadman itself) -- are always
+        applied."""
         if seq is None:
             return True
         if epoch != self._jog_epoch:
@@ -1994,11 +1899,11 @@ class RailController:
         return True
 
     def _apply_jog_velocity(self, velocity, direction, seq, epoch):
-        """Commit a joystick command: the ordering check, the velocity write and
-        the deadman/direction bookkeeping, all under _jog_lock so concurrent
-        handler threads apply their commands one at a time and in seq order (see
-        jog_velocity). direction must be non-zero -- a release goes through
-        jog_stop, which holds the same lock."""
+        """Commit a joystick command: the ordering check, the velocity write
+        and the deadman/direction bookkeeping, all under _jog_lock so
+        concurrent handler threads apply their commands one at a time and in
+        seq order (see jog_velocity). direction must be non-zero -- a release
+        goes through jog_stop, which holds the same lock."""
         with self._jog_lock:
             if not self._accept_jog_order(seq, epoch):
                 return True, "superseded by a newer command"
@@ -2017,16 +1922,15 @@ class RailController:
 
     def jog_stop(self, seq=None, epoch=None):
         """Release jog: ramp to zero but stay in operation enabled so the next
-        press responds immediately. Disarms the manual-drive deadman -- there is
-        no longer a manual command standing that could go stale.
+        press responds immediately. Disarms the deadman -- no manual command is
+        left standing that could go stale.
 
         Shares _jog_lock (and, when the caller passes one, the seq ordering
         check) with _apply_jog_velocity, so a release can never be undone by a
-        drag update that was still in flight when the operator let go.
-
-        Internal stops -- an end stop, the soft down limit, the deadman itself --
-        pass no seq and are therefore always applied; suppressing one of those
-        as 'stale' is never right."""
+        drag update that was still in flight when the operator let go. Internal
+        stops -- an end stop, the soft down limit, the deadman itself -- pass
+        no seq and are therefore always applied; suppressing one as 'stale' is
+        never right."""
         with self._jog_lock:
             if not self._accept_jog_order(seq, epoch):
                 return True, "superseded by a newer command"
@@ -2037,16 +1941,15 @@ class RailController:
                 return False, self.last_error or "failed to stop jog"
             return True, "ok"
 
-    # -- lift-specific template -------------------------------------------
-    # The readout above already works for the lift unchanged. These wrappers
-    # give the payload winch its own up/down semantics. For now they are the
-    # generic jog; fill in the real behaviour later.
+    # -- lift-specific template ------------------------------------------- The
+    # readout above already works for the lift unchanged; these wrappers give
+    # the payload winch its own up/down semantics. For now they are the generic
+    # jog -- fill in the real behaviour later.
 
     def _wait_for_mode(self, mode):
-        """Poll Modes of operation display (6061h) until it reports the drive is
-        actually running the given mode of operation, or MODE_SWITCH_TIMEOUT_S
-        elapses. Returns True once the mode is active, False on timeout/read
-        error. Callers must have written 6060h first; this closes the gap before
+        """Poll Modes of operation display (6061h) until the drive reports it
+        is actually running the given mode, or MODE_SWITCH_TIMEOUT_S elapses.
+        Callers must have written 6060h first; this closes the gap before
         reading any mode-dependent object (e.g. statusword bit 12)."""
         deadline = time.monotonic() + MODE_SWITCH_TIMEOUT_S
         while time.monotonic() < deadline:
@@ -2060,38 +1963,38 @@ class RailController:
         stop, so the position it is at right now IS the home reference and
         homing method 35 can just take it.
 
-        'Standing still' is |606Ch| <= VELOCITY_ZERO_RPM. It is read from 606Ch
-        rather than the statusword speed flag because that flag lives on bit 12,
-        which in Homing mode means "Homing attained" instead -- and this check
-        has to be usable while Homing mode is already selected.
-
-        'At the top end stop' is Quick stop active OR the positive-limit input
-        (60FDh bit 1). Both are checked because which one you get depends on the
-        drive's Quick Stop Option Code (605Ah), which is configured on the
-        controller and not known here.
+        'Standing still' is |606Ch| <= VELOCITY_ZERO_RPM, read from 606Ch
+        rather than the statusword speed flag because that flag shares bit 12
+        with "Homing attained" -- and this check has to work with Homing mode
+        already selected. 'At the top end stop' is Quick stop active OR the
+        positive-limit input (60FDh bit 1); which one you get depends on the
+        drive's Quick Stop Option Code (605Ah), configured on the controller
+        and not known here.
         """
         if velocity is None or abs(velocity) > VELOCITY_ZERO_RPM:
             return False
         return _quick_stop_active(status_word) or bool(pos_limit)
 
     def _enter_homing_mode(self):
-        """Select Homing mode (6060h = 6) and wait for 6061h to confirm the drive
-        is actually running it. Required before reading any mode-dependent object
-        (statusword bit 12) or issuing the homing start edge. True once active."""
+        """Select Homing mode (6060h = 6) and wait for 6061h to confirm the
+        drive is actually running it -- required before reading a
+        mode-dependent object (statusword bit 12) or issuing the homing start
+        edge. True once active."""
         self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_HOMING)
         return self._wait_for_mode(DRIVE_MODE_HOMING)
 
     def _leave_homing_mode(self, keep_enabled):
-        """Reselect Profile Velocity on the way out of Homing mode. Run on EVERY
-        exit, success or failure, so the drive is never stranded in Homing mode --
-        that would leave statusword bit 12 reading as "Homing attained" instead of
-        the speed flag, and the next jog fighting the wrong mode.
+        """Reselect Profile Velocity on the way out of Homing mode. Run on
+        EVERY exit, success or failure, so the drive is never stranded in
+        Homing mode -- that would leave statusword bit 12 reading as "Homing
+        attained" instead of the speed flag, and the next jog fighting the
+        wrong mode.
 
         keep_enabled: True after a homing run -- hold zero velocity and put the
-        controlword back to 0x0F, which both keeps the drive in Operation enabled
-        and clears the homing start bit so the next run gets a real rising edge.
-        False after a read-only check -- leave the state machine as it was found,
-        commanding nothing.
+        controlword back to 0x0F, which keeps the drive in Operation enabled
+        and clears the homing start bit so the next run gets a real rising
+        edge. False after a read-only check -- leave the state machine as it
+        was found.
         """
         self._write(OD_MODE_OF_OPERATION, DRIVE_MODE_PROFILE_VELOCITY)
         # Confirm via 6061h like every other mode change: a jog issued right
@@ -2109,7 +2012,7 @@ class RailController:
         home/zero reference, no motion (C5-E manual "6098h Homing Method").
 
         Assumes the caller already brought the drive to 'Operation enabled' and
-        THEN selected + confirmed Homing mode (enable first -- see the note in
+        THEN selected + confirmed Homing mode (enable first -- see
         check_homing), and that the lift is resting on the top end stop. Sets
         homing_complete / last_error; returns True once homing attained.
         """
@@ -2119,7 +2022,7 @@ class RailController:
             return False
 
         # Safety net: the caller enabled before the mode switch, so this is
-        # normally a single confirming statusword read. If the state dropped in
+        # normally a single confirming statusword read; if the state dropped in
         # between it re-runs the recovery, still without touching the mode.
         status_word = self._enable_keep_mode()
         if not _operation_enabled(status_word):
@@ -2127,11 +2030,10 @@ class RailController:
             self.last_error = "homing: could not re-enable drive at end stop"
             return False
 
-        # Rising edge on controlword bit 4 starts the homing operation. Write
-        # 0x0F first to guarantee bit 4 is LOW before raising it -- if a
-        # previous homing run was aborted with the start bit left high (e.g.
-        # the process was killed mid-homing), 0x1F alone has no edge and the
-        # procedure would never start.
+        # Rising edge on controlword bit 4 starts homing. Write 0x0F first to
+        # guarantee bit 4 is LOW before raising it: if a previous run was
+        # aborted with the start bit left high (process killed mid-homing),
+        # 0x1F alone has no edge and the procedure would never start.
         self._write(OD_CONTROL_WORD, 0x0F)
         if not self._write(OD_CONTROL_WORD, CONTROLWORD_START_HOMING):
             self.homing_complete = False
@@ -2143,29 +2045,30 @@ class RailController:
 
     def check_homing(self):
         """Lift only: establish the homing state at connect and, if the lift is
-        already parked on the top end stop, home it there and then -- the normal
-        way this rig starts up, since it is left hanging on its top end stop.
+        already parked on the top end stop, home it there and then -- the
+        normal way this rig starts up, since it is left hanging on that stop.
 
-        ORDER MATTERS: a lift parked on the end stop is sitting in 'Quick stop
-        active', and the drive does not take a 6060h mode change in that state --
-        6061h keeps reporting the old mode and the switch to Homing mode times
-        out. So when the lift is resting on the stop, the drive is brought to
-        'Operation enabled' FIRST (pure state-machine recovery: target velocity
-        held at 0, no motion -- see _enable_keep_mode), and only then is Homing
-        mode selected. With the mode active, statusword bit 12 ("Homing
-        attained", C5-E manual p.79) decides:
+        ORDER MATTERS: a lift parked on the end stop sits in 'Quick stop
+        active', where the drive does not take a 6060h mode change -- 6061h
+        keeps reporting the old mode and the switch to Homing mode times out.
+        So when the lift rests on the stop, the drive is brought to 'Operation
+        enabled' FIRST (pure state-machine recovery, no motion -- see
+        _enable_keep_mode), and only then is Homing mode selected. With the
+        mode active, statusword bit 12 ("Homing attained", C5-E manual p.79)
+        decides:
 
-          * bit 12 set -> already homed, nothing to do;
-          * bit 12 clear and resting on the top end stop -> home on the current
-            position with method 35, right here, still in Homing mode;
-          * bit 12 clear and NOT on the end stop -> stay unhomed. The lift is
-            locked UP-only (see _down_locked) and the poll loop homes it as soon
-            as the operator drives it up into the stop (_maybe_home_at_endstop).
+          * set -> already homed, nothing to do;
+          * clear and resting on the top end stop -> home on the current position
+            with method 35, right here, still in Homing mode;
+          * clear and NOT on the end stop -> stay unhomed. The lift is locked
+            UP-only (see _down_locked) and the poll loop homes it as soon as the
+            operator drives it up into the stop (_maybe_home_at_endstop).
 
-        Called from connect() BEFORE the poll thread starts, so it has the bus to
-        itself and the lift is ready by the time the UI comes up. Always restores
-        Profile Velocity on the way out. Returns True if the homing state was
-        established, False if it could not be read (homing_complete left None).
+        Called from connect() BEFORE the poll thread starts, so it has the bus
+        to itself and the lift is ready by the time the UI comes up. Always
+        restores Profile Velocity on the way out. Returns True if the homing
+        state was established, False if it could not be read (homing_complete
+        left None).
         """
         if self._simulate:
             self.homing_complete = True
@@ -2176,13 +2079,14 @@ class RailController:
         try:
             # Resting on the end stop? Decided from 606Ch / 60FDh / the state
             # machine, all readable in any mode -- deliberately BEFORE the mode
-            # switch, because it determines whether we must enable first.
+            # switch, since it decides whether we must enable first.
             resting = self._resting_on_endstop(self._read(OD_STATUS_WORD),
                                                self._read_velocity_rpm(),
                                                self._read_pos_limit())
             if resting:
                 # Recover to Operation enabled while still in Profile Velocity;
-                # in Quick stop active the mode change below would not be taken.
+                # in Quick stop active the mode change below would not be
+                # taken.
                 if not _operation_enabled(self._enable_keep_mode()):
                     self.homing_complete = None
                     self.last_error = "homing check: could not enable drive at end stop"
@@ -2216,30 +2120,29 @@ class RailController:
     def _run_endstop_homing(self):
         """Lift only: home against the top end stop with homing method 35.
 
-        The same homing check_homing() does at connect, but entered on a
-        background thread by _maybe_home_at_endstop() when the lift was NOT on
-        the end stop at startup and the operator has now driven it up into one.
-        Sets homing_complete = True on success, which lifts the down-motion lock;
-        on failure the lock stays in place, the drive is stopped (brake closed)
-        and the next poll retries HOMING_RETRY_INTERVAL_S after this attempt
-        ENDED. homing_in_progress guards re-entry and is always cleared on
-        exit."""
+        The same homing check_homing() does at connect, but on a background
+        thread from _maybe_home_at_endstop() when the lift was NOT on the end
+        stop at startup and the operator has now driven it up into one. Success
+        sets homing_complete = True, lifting the down-motion lock; on failure
+        the lock stays, the drive is stopped (brake closed) and the next poll
+        retries HOMING_RETRY_INTERVAL_S after this attempt ENDED.
+        homing_in_progress guards re-entry and is always cleared on exit."""
         try:
             if self._simulate:
                 self.homing_complete = True
                 return
 
-            # Enable FIRST: the lift is sitting on the end stop, typically in
-            # 'Quick stop active', where the drive does not take a 6060h mode
-            # change (see check_homing). No motion: target velocity is held at 0.
+            # Enable FIRST: the lift sits on the end stop, typically in 'Quick
+            # stop active', where the drive does not take a 6060h mode change
+            # (see check_homing). No motion: target velocity is held at 0.
             if not _operation_enabled(self._enable_keep_mode()):
                 self.homing_complete = False
                 self.last_error = "homing: could not re-enable drive at end stop"
                 return
 
             # Only now select Homing mode, and confirm it is active before
-            # relying on the homing-specific statusword bits (bit 12 "attained"
-            # / bit 13 "error").
+            # relying on the homing statusword bits (12 "attained" / 13
+            # "error").
             if not self._enter_homing_mode():
                 self.homing_complete = False
                 self.last_error = "homing: drive did not enter Homing mode"
@@ -2251,21 +2154,20 @@ class RailController:
                 self._leave_homing_mode(keep_enabled=True)
                 if not self.homing_complete:
                     # A FAILED attempt must not walk away leaving the lift on
-                    # motor current: every exit above ran through
-                    # _enable_keep_mode / keep_enabled=True, so the brake is
-                    # open, and the next retry is HOMING_RETRY_INTERVAL_S away
-                    # with the idle auto-stop held off the whole time
-                    # (homing_in_progress). A home that keeps failing would
-                    # otherwise hold the payload on current indefinitely. The
-                    # lift is resting on the top end stop; the closed brake
-                    # holds it.
+                    # motor current: every exit above ran with
+                    # keep_enabled=True, so the brake is open and the next
+                    # retry is HOMING_RETRY_INTERVAL_S away with the idle
+                    # auto-stop held off throughout (homing_in_progress) -- a
+                    # home that keeps failing would otherwise hold the payload
+                    # on current indefinitely. The lift rests on the top end
+                    # stop; the closed brake holds it.
                     self.stop_motor()
-            # Stamp the retry gap from the END of the attempt. Stamped only at
-            # the start, a failing attempt that takes longer than
-            # HOMING_RETRY_INTERVAL_S (each step here has a multi-second
-            # timeout) is already overdue when it finishes, so the next poll
-            # re-fires immediately: homing_in_progress would then never be
-            # clear for long enough for the idle auto-stop to time out.
+            # Stamp the retry gap from the END of the attempt: stamped at the
+            # start, a failing attempt longer than HOMING_RETRY_INTERVAL_S
+            # (each step here has a multi-second timeout) is already overdue
+            # when it finishes and the next poll re-fires immediately --
+            # homing_in_progress would then never be clear long enough for the
+            # idle auto-stop to time out.
             self._last_homing_attempt = time.monotonic()
             self.homing_in_progress = False
 
@@ -2292,13 +2194,13 @@ class RailController:
             time.sleep(HOMING_POLL_S)
 
     def lift_up(self):
-        # TODO(lift): enforce upper travel limit / max payload height, and
-        # any load-holding brake release sequence before moving up.
+        # TODO(lift): enforce upper travel limit / max payload height, and any
+        # load-holding brake release sequence before moving up.
         return self.jog(+1)
 
     def lift_down(self):
-        # TODO(lift): enforce lower travel limit and controlled-descent /
-        # brake behaviour so the payload can't free-fall.
+        # TODO(lift): enforce lower travel limit and controlled-descent / brake
+        # behaviour so the payload can't free-fall.
         return self.jog(-1)
 
     # -- software PID balance loop (from motion_test.run_position_control) --
@@ -2312,10 +2214,10 @@ class RailController:
             return False, self.last_error or "failed to enable drive"
         p = self.get_params()
         self._apply_motion_profile(p["pid_accel"], p["pid_jerk"])
-        # The PID loop is now the owner of the velocity command. Drop any
-        # manual-drive lease (and the direction a still-held joystick left
-        # behind) so the deadman cannot fire a zero velocity into the running
-        # loop -- jog_velocity refuses while the PID runs, so nothing re-arms it.
+        # The PID loop now owns the velocity command. Drop any manual-drive
+        # lease (and the direction a still-held joystick left behind) so the
+        # deadman cannot fire a zero velocity into the running loop --
+        # jog_velocity refuses while the PID runs, so nothing re-arms it.
         self.jog_direction = 0
         self._jog_deadline = None
         self._pid_stop.clear()
@@ -2339,11 +2241,11 @@ class RailController:
         """Gain scale from the current rope payout (see PID_ROPE_COUNTS_AT_TOP).
 
         Reads the lift's cached snapshot (10 Hz poller) rather than the bus:
-        rope length changes slowly, so staleness is harmless and the 100 Hz
-        PID loop adds no bus traffic. Falls back to 1.0 -- the unscaled
-        loop -- whenever a trustworthy payout is not available: no lift wired
-        in, lift not connected, not homed (6064h has no reference then), or
-        no position read yet."""
+        rope length changes slowly, so staleness is harmless and the 100 Hz PID
+        loop adds no bus traffic. Falls back to 1.0 -- the unscaled loop --
+        whenever no trustworthy payout is available: no lift wired in, lift not
+        connected, not homed (6064h has no reference then), or no position read
+        yet."""
         lift = self.length_source
         if lift is None or not lift.connected or lift.homing_complete is not True:
             return 1.0
@@ -2358,38 +2260,36 @@ class RailController:
     def run_pid_loop(self):
         """Direct velocity PID on the analog angle -> hold it at PID_SETPOINT.
 
-        Faithful to motion_test.run_position_control(): D term on the raw
-        angle (not the deadzoned error), anti-windup + slow integral leak,
-        output clamped to +/- max_speed. The gains are read live from params
-        every iteration, so the UI retunes it on the fly; the setpoint is
-        fixed (PID_SETPOINT) and no longer part of the UI.
+        Faithful to motion_test.run_position_control(): D term on the raw angle
+        (not the deadzoned error), anti-windup + slow integral leak, output
+        clamped to +/- max_speed. Gains are read live from params every
+        iteration, so the UI retunes it on the fly; the setpoint is fixed
+        (PID_SETPOINT).
 
         With length_comp on, the deadzoned error and the derivative are both
         multiplied by the rope-length scale (_rope_length_scale), converting
         the angle terms into horizontal-offset terms up to a constant: the
-        deeper the robot hangs, the stronger the correction for the same
-        angle. Scaling both P/I and D by the same factor keeps the damping
-        ratio of the tuning intact. The deadzone stays in raw digits -- it is
-        a sensor-noise band, not a physical distance.
+        deeper the robot hangs, the stronger the correction for the same angle.
+        Scaling both P/I and D by the same factor keeps the tuning's damping
+        ratio intact. The deadzone stays in raw digits -- it is a sensor-noise
+        band, not a distance.
 
         The angle is read fresh from the bus every iteration (_read_angle):
-        the poller snapshot only updates at 10 Hz, and feeding that to a
-        100 Hz loop adds up to 100 ms of sensor delay -- enough phase lag to
-        drive a fast oscillation at the pendulum's natural frequency.
+        feeding the 10 Hz poller snapshot to a 100 Hz loop adds up to 100 ms of
+        sensor delay, enough phase lag to drive a fast oscillation at the
+        pendulum's natural frequency.
 
-        End stops: unlike jog(), the PID output can swing into a limit
-        switch mid-run rather than only when a fixed direction is first
-        commanded, so this checks on every iteration instead of only at
-        start_pid(). The poller's cached state (cheap, no bus round trip)
-        is still used for that gating -- limit switches and Quick stop
-        don't need 100 Hz freshness -- and _ensure_operation_enabled(),
-        with its own fresh read, is only actually invoked (bus round
-        trip(s)) when that cached state suggests it's needed.
+        End stops: unlike jog(), the PID output can swing into a limit switch
+        mid-run rather than only when a fixed direction is first commanded, so
+        this checks every iteration. The gating uses the poller's cached state
+        (cheap, no bus round trip -- limit switches and Quick stop don't need
+        100 Hz freshness) and only invokes _ensure_operation_enabled(), with
+        its own fresh read, when that suggests it's needed.
 
-        Paced against a monotonic deadline like _heartbeat_loop: each
-        iteration now spends two bus round trips (angle read + velocity
-        write), and sleeping the full interval on top of that would
-        stretch the effective period well past the 10 ms target.
+        Paced against a monotonic deadline like _heartbeat_loop: each iteration
+        spends two bus round trips (angle read + velocity write), and sleeping
+        the full interval on top would stretch the period well past the 10 ms
+        target.
         """
         integral = 0.0
         filtered_rate = 0.0
@@ -2443,8 +2343,8 @@ class RailController:
             delay = next_tick - time.monotonic()
             if delay <= 0:
                 # The bus round trips overran the interval: re-anchor and run
-                # the next iteration immediately rather than bursting to
-                # catch up.
+                # the next iteration immediately rather than bursting to catch
+                # up.
                 next_tick = time.monotonic()
                 continue
             self._pid_stop.wait(delay)
@@ -2454,9 +2354,9 @@ class RailController:
     # -- simulation --------------------------------------------------------
 
     def _simulate_state(self):
-        """Cheap physics stub so the UI works with no hardware. Called from
-        the poller AND from fast fresh-read paths (_read_velocity_rpm), hence
-        the lock -- see _sim_lock in __init__."""
+        """Cheap physics stub so the UI works with no hardware. Called from the
+        poller AND from fast fresh-read paths (_read_velocity_rpm), hence the
+        lock -- see _sim_lock in __init__."""
         with self._sim_lock:
             return self._simulate_state_locked()
 
@@ -2465,16 +2365,15 @@ class RailController:
         dt = min(now - self._sim_last, 0.5)
         self._sim_last = now
 
-        # Lift only: current-limit physics for the Walking tension phase.
-        # With 2031h clamped below what lifting the payload "needs", the
-        # velocity servo loses: upward motion reels in slack until the
-        # taut-rope position (the fake ground) and stalls there; with the
-        # limit at 0 the drum produces no torque and stands still; a
-        # simulated fall (POST /api/lift/sim_fall) has gravity back-drive
-        # the under-torqued drum. In all three cases the servo ramp below
-        # must NOT apply -- a torque-starved drive cannot pull toward its
-        # velocity target. Decided BEFORE integrating position, so a
-        # stalled/torqueless drum cannot creep.
+        # Lift only: current-limit physics for the Walking tension phase. With
+        # 2031h clamped below what lifting the payload "needs", the velocity
+        # servo loses: upward motion reels in slack until the taut-rope
+        # position (the fake ground) and stalls there; at a limit of 0 the drum
+        # produces no torque and stands still; a simulated fall (POST
+        # /api/lift/sim_fall) has gravity back-drive the under-torqued drum. In
+        # all three the servo ramp below must NOT apply -- a torque-starved
+        # drive cannot pull toward its velocity target. Decided BEFORE
+        # integrating position, so a stalled/torqueless drum cannot creep.
         servo_overridden = False
         if (self.role == "lift" and self._sim_current_limit is not None
                 and self._sim_current_limit < SIM_LIFT_HOLD_CURRENT_MA):
@@ -2490,8 +2389,8 @@ class RailController:
                 self._sim_velocity = 0.0
                 servo_overridden = True
         else:
-            # Full current available again (catch / restore): the velocity
-            # loop is back in charge, the fall is over.
+            # Full current available again (catch / restore): the velocity loop
+            # is back in charge, the fall is over.
             self._sim_falling = False
 
         # First-order velocity ramp toward the commanded target -- only while
@@ -2510,7 +2409,7 @@ class RailController:
         # 6041h: operation-enabled (0x0637) vs switch-on-disabled (0x0640).
         status_word = 0x0637 if self.drive_enabled else 0x0640
         # Brake (60FEh:01h bit 0) tracks the drive: released while enabled,
-        # engaged (closed) when idle, so the sim shows the bit toggling.
+        # closed when idle, so the sim shows the bit toggling.
         digital_outputs = 0 if self.drive_enabled else (1 << DIGITAL_OUTPUT_BIT_BRAKE)
         # No physical limit switches to simulate; report both clear.
         return {
@@ -2523,8 +2422,8 @@ class RailController:
             "control_word": 0x000F if self.drive_enabled else 0x0006,
             "digital_inputs": 0,
             "digital_outputs": digital_outputs,
-            # Actual Current (2039h:05h) in mA; roughly proportional to
-            # velocity, collapsing below the fake ground (see _sim_current).
+            # Actual Current (2039h:05h) in mA; roughly velocity-proportional,
+            # collapsing below the fake ground (see _sim_current).
             "motor_current": self._sim_current(),
             "neg_limit": False,
             "pos_limit": False,
@@ -2587,8 +2486,8 @@ class ControllerManager:
                 ctrl = RailController(name, suffix, None, None, self._bus_lock,
                                       simulate=True, role=role)
                 # Lift only: establish the homing state before the poll thread
-                # starts, as on real hardware. (In simulate, check_homing just
-                # reports it homed.)
+                # starts, as on real hardware (in simulate it just reports
+                # homed).
                 if role == "lift":
                     ctrl.check_homing()
                 ctrl.start()
@@ -2652,16 +2551,17 @@ class ControllerManager:
                                           self._bus_lock, simulate=False, role=role)
                     # Feed the NanoJ connection watchdog BEFORE anything walks
                     # the state machine: a drive whose watchdog is already
-                    # armed (previous run, no power cycle since) is spamming
-                    # controlword 0 until the heartbeat resumes, and the
+                    # armed (previous run, no power cycle since) spams
+                    # controlword 0 until the heartbeat resumes, and
                     # check_homing() below could never enable against that.
                     ctrl.start_heartbeat()
                     # Lift only: establish the homing state -- and home on the
-                    # spot if it is already parked on the top end stop, the usual
-                    # case -- BEFORE the poll thread starts, so check_homing() has
-                    # the bus to itself and nothing races its mode switch. If it
-                    # is not on the stop it stays unhomed and UP-only until the
-                    # operator drives it up there (_maybe_home_at_endstop).
+                    # spot if it is already parked on the top end stop, the
+                    # usual case -- BEFORE the poll thread starts, so
+                    # check_homing() has the bus to itself and nothing races
+                    # its mode switch. If it is not on the stop it stays
+                    # unhomed and UP-only until the operator drives it up there
+                    # (_maybe_home_at_endstop).
                     if role == "lift":
                         ctrl.check_homing()
                         print(f"  --> {name.upper()}: homing "
@@ -2689,8 +2589,7 @@ class ControllerManager:
     def _wire_length_source(self):
         """Point the cart at the lift for rope-length gain scaling (see
         RailController._rope_length_scale). Harmless when either controller is
-        missing: the cart's length_source stays/becomes None and the PID scale
-        falls back to 1.0."""
+        missing: length_source stays None and the PID scale falls back to 1.0."""
         cart = self.controllers.get("cart")
         if cart is not None:
             cart.length_source = self.controllers.get("lift")
@@ -2711,10 +2610,10 @@ class ControllerManager:
     # -- settings persistence (config/settings.json) -----------------------
 
     def save_settings(self):
-        """Write every controller's current params to _SETTINGS_FILE,
-        creating config/ if it doesn't exist yet. Written via a temp file +
-        os.replace so a crash mid-write can't leave a truncated/corrupt file
-        behind for load_settings() to trip over."""
+        """Write every controller's current params to _SETTINGS_FILE, creating
+        config/ if needed. Written via a temp file + os.replace so a crash
+        mid-write can't leave a truncated file behind for load_settings() to
+        trip over."""
         data = {name: ctrl.get_params() for name, ctrl in self.controllers.items()}
         try:
             os.makedirs(_CONFIG_DIR, exist_ok=True)
@@ -2728,9 +2627,9 @@ class ControllerManager:
 
     def load_settings(self):
         """Load _SETTINGS_FILE (if present) onto the live controllers. Falls
-        back to whatever defaults are already in place (from the role schema) if
-        the file is missing or malformed -- this must never raise, since it
-        also runs unattended at startup."""
+        back to the defaults already in place (from the role schema) if the
+        file is missing or malformed -- this must never raise, since it also
+        runs unattended at startup."""
         if not os.path.isfile(_SETTINGS_FILE):
             return False, "no settings file present; using defaults"
         try:
@@ -2796,16 +2695,14 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     POST /api/<name>/jog_velocity-> {velocity: signed rpm, seq: int, epoch: str}
                                      Joystick drive. A held stick must be
                                      REPEATED (the UI does so every
-                                     JOY_HOLD_INTERVAL_MS) or the manual-drive
-                                     deadman stops the axis after
-                                     JOG_DEADMAN_TIMEOUT_S -- see
-                                     _enforce_jog_deadman. seq is a counter that
-                                     must increase within one epoch (a UI
-                                     session id); lower ones are dropped as
-                                     reordered stragglers (reported ok). Both
-                                     are optional -- but without them a release
-                                     can be overtaken by an update that was
-                                     still in flight. See _accept_jog_order.
+                                     JOY_HOLD_INTERVAL_MS) or the deadman stops
+                                     the axis after JOG_DEADMAN_TIMEOUT_S (see
+                                     _enforce_jog_deadman). seq must increase
+                                     within one epoch (a UI session id); lower
+                                     ones are dropped as reordered stragglers
+                                     (reported ok). Both optional -- but without
+                                     them a release can be overtaken by an
+                                     in-flight update. See _accept_jog_order.
     POST /api/<name>/jog_stop
     POST /api/<name>/stop
     POST /api/<name>/enable
@@ -2851,10 +2748,10 @@ class RailRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", _STATIC_TYPES.get(ext, "application/octet-stream"))
         self.send_header("Content-Length", str(len(body)))
-        # Without cache headers, browsers apply HEURISTIC caching and a plain
-        # reload can keep serving a stale index.html/app.js for hours -- UI
-        # changes then silently don't arrive. The files are tiny and served
-        # over the local network, so just always fetch them fresh.
+        # Without cache headers browsers apply HEURISTIC caching and a plain
+        # reload can keep serving a stale index.html/app.js for hours, so UI
+        # changes silently don't arrive. The files are tiny and local: always
+        # fetch fresh.
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
@@ -2995,8 +2892,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             return ctrl.rearm_walk()
         if action == "sim_fall":
             # Test hook for the Walking-mode fall catch: gravity starts
-            # back-driving the fake drum (see _simulate_state). No effect on
-            # real hardware -- simulate mode only.
+            # back-driving the fake drum (see _simulate_state). Simulate mode
+            # only.
             if not self.manager.simulate or ctrl.role != "lift":
                 return False, "sim_fall is simulate-mode, lift-only"
             ctrl._sim_falling = True
