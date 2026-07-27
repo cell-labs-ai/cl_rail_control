@@ -25,9 +25,22 @@ const JOY_AXIS = { cart: "x", lift: "y" };
 // resting hand from creeping the drive.
 const JOY_DEADZONE = 0.06;
 
-// Minimum gap between velocity posts while dragging (ms). A release (velocity
-// 0) bypasses this and is sent immediately.
-const JOY_SEND_INTERVAL_MS = 80;
+// How often a HELD joystick re-posts its current velocity (ms). This is not
+// just throttling: the repeat is a deadman heartbeat. The server holds a manual
+// drive command for JOG_DEADMAN_TIMEOUT_S (rail_web_ui.py) and stops the axis
+// once the repeats stop, so a release that never arrives -- lost POST, pointerup
+// that never fired, browser tab or WiFi gone -- stops the drive anyway. Keep
+// this at roughly a third of that timeout so a couple of dropped posts on the
+// shared WiFi bus don't nuisance-stop a drive that is still being steered.
+const JOY_HOLD_INTERVAL_MS = 100;
+
+// Identifies this page load in every joystick post. The server orders commands
+// by a counter that restarts at 1 whenever the page reloads, so it needs to know
+// when a counter belongs to a new session rather than being a stale straggler --
+// otherwise a browser refresh would leave the joystick dead, every command
+// rejected against the previous session's high-water mark. See _accept_jog_order
+// in rail_web_ui.py.
+const JOY_EPOCH = Math.random().toString(36).slice(2) + "-" + Date.now();
 
 const panelsEl = document.getElementById("panels");
 const linkBadge = document.getElementById("link-badge");
@@ -224,33 +237,57 @@ function makeParamRow(name, spec) {
   return { row, input, valEl: val };
 }
 
-// Throttled sender for joystick velocity updates. While dragging, send() is
-// rate-limited to JOY_SEND_INTERVAL_MS but always keeps the latest value
-// queued so the drive ends up at wherever the stick actually is. sendNow()
-// bypasses the throttle -- used for the release (velocity 0) so a stop can
-// never sit behind a queued non-zero update.
+// Sender for joystick velocity updates.
+//
+// A held stick is REPEATED at JOY_HOLD_INTERVAL_MS rather than posted only when
+// the value changes: that stream is the deadman heartbeat the server needs to
+// keep the drive running (see JOY_HOLD_INTERVAL_MS). hold() therefore starts a
+// ticker that keeps posting whatever the stick currently reads; release() stops
+// the ticker and posts one 0. The post rate is a flat 10/s while held instead of
+// the old up-to-12.5/s burst on every pointermove, so bus load is predictable;
+// the cost is up to one interval of latency on a mid-drag change, which is well
+// under the drive's own acceleration ramp.
+//
+// Every post carries an incrementing seq plus JOY_EPOCH. Posts are
+// fire-and-forget over WiFi and the server handles them on independent threads,
+// so an update issued just before the release can arrive after it; the server
+// drops anything whose seq it has already passed, which stops that straggler
+// from reinstating a velocity the operator has let go of. The epoch scopes the
+// counter to this page load -- see _accept_jog_order in rail_web_ui.py.
 function makeVelocitySender(name) {
   let timer = null;
-  let pending = null;
+  let current = 0;
+  let lastSent = null;
+  let seq = 0;
 
-  function flush() {
-    timer = null;
-    if (pending === null) return;
-    const v = pending;
-    pending = null;
-    post(name, "jog_velocity", { velocity: v });
-    timer = setTimeout(flush, JOY_SEND_INTERVAL_MS);
+  function send(v) {
+    lastSent = v;
+    post(name, "jog_velocity", { velocity: v, seq: ++seq, epoch: JOY_EPOCH });
+  }
+
+  // Repeat tick. A zero is sent once and then goes quiet: with nothing moving
+  // there is no lease to renew, and repeating it would put a Modbus write on the
+  // shared WiFi bus every interval while the stick simply rests in the deadzone.
+  // If that one zero is lost, the deadman stops the axis anyway.
+  function tick() {
+    if (current !== 0 || lastSent !== 0) send(current);
   }
 
   return {
-    send(v) {
-      pending = v;
-      if (!timer) flush();
+    // Latest stick value while held; starts the repeat ticker on first call.
+    hold(v) {
+      current = v;
+      if (timer === null) {
+        send(current);
+        timer = setInterval(tick, JOY_HOLD_INTERVAL_MS);
+      }
     },
-    sendNow(v) {
-      pending = null;
-      if (timer) { clearTimeout(timer); timer = null; }
-      post(name, "jog_velocity", { velocity: v });
+    // Stop repeating and command zero. Idempotent: safe to call from every
+    // path that can end a hold, including several for the same release.
+    release() {
+      if (timer !== null) { clearInterval(timer); timer = null; }
+      current = 0;
+      send(0);
     },
   };
 }
@@ -292,6 +329,7 @@ function makeJoystick(name, role) {
     fullScale: 0,
     limits: { pos: false, neg: false },
     dragging: false,
+    pointerId: null,   // the pointer that owns the current hold
   };
 
   function render(pos) {
@@ -316,32 +354,60 @@ function makeJoystick(name, role) {
   }
 
   function onMove(e) {
-    if (!joy.dragging) return;
+    if (!joy.dragging || e.pointerId !== joy.pointerId) return;
     e.preventDefault();
     const p = posFromEvent(e);
     render(p);
-    sender.send(Math.round(p * joy.fullScale));
+    sender.hold(Math.round(p * joy.fullScale));
+  }
+
+  // Spring back to centre and stop. Every way a hold can end funnels through
+  // here, and it takes no event, so it can also be called from the
+  // focus/visibility handlers below where there is no pointer event at all.
+  function release() {
+    if (!joy.dragging) return;
+    joy.dragging = false;
+    joy.pointerId = null;
+    track.classList.remove("dragging");
+    render(0);
+    sender.release();
   }
 
   function onUp(e) {
-    if (!joy.dragging) return;
-    joy.dragging = false;
-    track.classList.remove("dragging");
+    if (!joy.dragging || e.pointerId !== joy.pointerId) return;
     try { track.releasePointerCapture(e.pointerId); } catch (_) { /* not captured */ }
-    render(0);            // spring back to centre
-    sender.sendNow(0);    // and stop immediately
+    release();
   }
 
   track.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     joy.dragging = true;
+    joy.pointerId = e.pointerId;
     track.classList.add("dragging");
     try { track.setPointerCapture(e.pointerId); } catch (_) { /* older browsers */ }
     onMove(e);
   });
-  track.addEventListener("pointermove", onMove);
-  track.addEventListener("pointerup", onUp);
-  track.addEventListener("pointercancel", onUp);
+
+  // Pointer events go on WINDOW, not the track: setPointerCapture can fail (the
+  // try/catch above) or be revoked, and then the pointerup lands on whatever
+  // element is under the cursor -- leaving the stick logically held with a
+  // velocity standing on the drive. lostpointercapture covers revocation
+  // (browser gestures, a long-press context menu) explicitly.
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+  track.addEventListener("lostpointercapture", release);
+
+  // Nothing guarantees a pointer event at all when the page stops being the
+  // thing the operator is looking at: alt-tab, a tab switch, a phone screen
+  // lock, dev tools taking focus. Treat all of them as letting go. (The
+  // server-side deadman is the real backstop -- these just make the stop
+  // immediate instead of JOG_DEADMAN_TIMEOUT_S later.)
+  window.addEventListener("blur", release);
+  window.addEventListener("pagehide", release);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) release();
+  });
 
   render(0);
   return joy;

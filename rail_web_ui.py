@@ -20,7 +20,10 @@ The UI provides, per controller:
 
 The manual drive is a joystick: stick displacement sets the target velocity
 (0 at centre, +/- the full-scale joy speed at the ends), springing back to
-zero when released. The CART carries the full set -- joy max speed plus
+zero when released. A held stick is a lease, not a latch -- the UI repeats the
+command while it is held and the drive stops itself when the repeats stop, so
+letting go stops the axis even if the release never reaches the server (see
+JOG_DEADMAN_TIMEOUT_S). The CART carries the full set -- joy max speed plus
 acceleration/jerk, plus PID gain tuning (Kp/Ki/Kd) with a start/stop for the
 software balance loop. The LIFT is pared down to just the joy max speed: no
 jog accel/jerk, no PID, and no analog-angle readout.
@@ -123,6 +126,39 @@ DEFAULT_MODE = MODE_BASIC
 # standstill threshold) -- for this long, stop the motor like the STOP button
 # does (stop_motor: ramp to zero, leave the holding state, brake closed).
 LIFT_IDLE_STOP_TIMEOUT_S = 10.0
+
+# Manual-drive deadman. A joystick hold is a LEASE, not a latch: the UI repeats
+# the current stick velocity every JOY_HOLD_INTERVAL_MS (app.js) while the stick
+# is held, and every non-zero jog_velocity extends the lease by this much. When
+# the updates stop, _enforce_jog_deadman ramps the axis to zero -- so the axis
+# stops on the ABSENCE of input rather than needing a stop message to arrive.
+# That covers every way the release used to get lost:
+#
+#   * the release (velocity 0) POST failing, or being overtaken by a drag
+#     update that was already in flight (see also the seq guard in
+#     jog_velocity, which rejects the reordered one outright);
+#   * pointerup never firing at all -- lost pointer capture, a tab switch, a
+#     long-press context menu, screen lock;
+#   * the frontend going away mid-drag: browser tab closed, laptop asleep,
+#     WiFi dropped. Nothing can be sent then, which is exactly the point.
+#
+# Sized at 3-4 missed updates so a couple of dropped/late posts on the shared
+# WiFi bus don't nuisance-stop a drive that is still being steered. Worst-case
+# unwanted motion is this plus one STATE_POLL_INTERVAL_S (the poller runs the
+# check), i.e. ~450 ms of coasting at the commanded velocity.
+#
+# NB this guards the joystick path (jog_velocity) only. It deliberately does
+# NOT touch the PID loop or the Walking-mode auto-lower: those are autonomous
+# server-side behaviours -- the latter being the fall catch -- and must keep
+# running when a browser tab closes. It is also a mitigation, not a safety
+# function: the drive is not safety-rated, so the authoritative stop stays the
+# hardware chain (e-stop contactor + fail-safe brake).
+JOG_DEADMAN_TIMEOUT_S = 0.35
+# Prefix of the last_error the deadman raises. Used to recognise its own message
+# and retract it when manual drive engages again, so a fired timeout does not sit
+# in the UI's error line over an axis that is now being driven normally. Other
+# errors (end stop, travel limit) are left alone.
+JOG_DEADMAN_MESSAGE = "manual drive timed out"
 
 # Walking mode, part 1: auto-lower (see _run_walk_lower). The descent speed and
 # the touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can
@@ -670,6 +706,26 @@ class RailController:
         self.jog_direction = 0              # -1, 0, +1
         self.pid_running = False
         self.last_error = None
+        # Serialises the moment a manual-drive command is committed --
+        # _apply_jog_velocity and jog_stop -- so the three fields below and the
+        # target-velocity write move together. Without it, joystick updates
+        # arriving on separate handler threads can reach the drive out of order
+        # (see jog_velocity). Reentrant because jog_velocity(0) delegates to
+        # jog_stop. Lock order is ALWAYS _jog_lock before the bus lock.
+        self._jog_lock = threading.RLock()
+        # Manual-drive deadman (see JOG_DEADMAN_TIMEOUT_S). The monotonic time
+        # by which the next joystick update must arrive; None = not armed. Armed
+        # ONLY by a non-zero jog_velocity, and disarmed by every path that takes
+        # manual drive away again.
+        self._jog_deadline = None
+        # True once the deadman has fired for the current lease, so a stop that
+        # keeps failing (dead link) retries silently instead of logging at 10 Hz.
+        self._jog_deadman_tripped = False
+        # Joystick command ordering (see _accept_jog_order): the highest seq
+        # applied, and the UI session it came from. Both None until the first
+        # seq-stamped command arrives.
+        self._jog_seq = None
+        self._jog_epoch = None
         # Lift only: whether homing has been performed. Read once at connect via
         # check_homing() (statusword bit 12); None until checked / on the cart,
         # which has no homing. While this is not True, the lift is locked to
@@ -850,6 +906,7 @@ class RailController:
             self._sync_drive_flags(snapshot)
             self._maybe_home_at_endstop(snapshot)
             self._enforce_down_limit(snapshot)
+            self._enforce_jog_deadman()
             self._maybe_idle_stop(snapshot)
             self._stop_event.wait(STATE_POLL_INTERVAL_S)
 
@@ -879,6 +936,7 @@ class RailController:
         if self.drive_enabled and not _operation_enabled(snapshot.get("status_word")):
             self.drive_enabled = False
             self.jog_direction = 0
+            self._jog_deadline = None    # nothing left for the deadman to stop
 
     def set_mode(self, mode):
         """Apply the system-wide operating mode to this controller. The idle
@@ -957,6 +1015,39 @@ class RailController:
             print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
                   f"auto-stop FAILED -- {self.last_error}")
 
+    def _enforce_jog_deadman(self):
+        """Ramp a manual (joystick) drive to zero once its lease has expired --
+        i.e. the UI stopped repeating the stick velocity. See
+        JOG_DEADMAN_TIMEOUT_S for what that covers and why.
+
+        Guarded on jog_direction as well as the deadline, so every path that
+        takes manual drive away (STOP, a quick stop the drive did itself and
+        _sync_drive_flags noticed, leaving Homing mode, the Walking-mode
+        descent) implicitly disarms this -- the deadman only ever acts on a
+        manual drive command that is still standing.
+
+        A failed stop write pushes the deadline out by one poll cycle instead of
+        disarming: a single dropped Modbus write must not be the thing that
+        leaves the axis running. Only the first attempt logs, so a dead link
+        retries quietly rather than at the poll rate."""
+        if (self._jog_deadline is None or self.jog_direction == 0
+                or time.monotonic() < self._jog_deadline):
+            return
+        first = not self._jog_deadman_tripped
+        self._jog_deadman_tripped = True
+        ok, _message = self.jog_stop()      # clears _jog_deadline
+        reason = (f"{JOG_DEADMAN_MESSAGE} (no update for "
+                  f"{JOG_DEADMAN_TIMEOUT_S:.2f}s) -- ")
+        if ok:
+            self.last_error = reason + "stopped"
+        else:
+            # Keep the write error in the message: that is the actionable part.
+            self.last_error = reason + f"STOP FAILED, retrying: {self.last_error}"
+            self._jog_deadline = time.monotonic() + STATE_POLL_INTERVAL_S
+        if first:
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
+                  f"{self.last_error}")
+
     # -- Walking mode: auto-lower, then rope tension -----------------------
 
     def _read_max_current(self):
@@ -1021,6 +1112,10 @@ class RailController:
             return False, self.last_error
         self._cancel_walk()               # serialise with a previous descent
         self._walk_stop.clear()
+        # Drop any manual-drive lease before the walk thread starts driving:
+        # the descent sets jog_direction itself, and a deadline left over from a
+        # jog moments ago would otherwise expire into the descent and stop it.
+        self._jog_deadline = None
         self.walk_status = "lowering"
         self.last_error = None
         self._walk_thread = threading.Thread(
@@ -1661,6 +1756,7 @@ class RailController:
         # the walk thread itself calls stop_motor() on touchdown/abort.
         self._walk_stop.set()
         self.jog_direction = 0
+        self._jog_deadline = None       # no manual command left to time out
         if self._simulate:
             self._sim_target_velocity = 0.0
             self.drive_enabled = False
@@ -1763,6 +1859,12 @@ class RailController:
         drive out of the 'Quick stop active' state the limit switch forced
         it into (see _walk_to_operation_enabled), so normal operation resumes
         as soon as it's commanded.
+
+        NB unlike jog_velocity this is a LATCHED jog with no deadman: it drives
+        until something stops it. The UI does not use it (the manual drive is the
+        joystick), so it is left as is -- but any client that does must send its
+        own release, and gets no protection if it goes away mid-jog. Route new
+        hold-to-drive callers through jog_velocity instead.
         """
         direction = max(-1, min(1, int(direction)))
         if direction == 0:
@@ -1794,7 +1896,7 @@ class RailController:
         self.jog_direction = direction
         return True, "ok"
 
-    def jog_velocity(self, velocity):
+    def jog_velocity(self, velocity, seq=None, epoch=None):
         """Joystick drive: command an arbitrary signed target velocity (rpm),
         whose magnitude is how far the stick is pushed. 0 releases the stick
         (ramp to zero, stay enabled) so the next push responds immediately.
@@ -1806,7 +1908,28 @@ class RailController:
         Engagement is lazy: the CiA-402 enable + motion-profile writes only run
         when starting from rest or reversing across zero, so the stream of
         small updates a dragged stick produces is just a target-velocity write
-        each -- not a full re-enable every time."""
+        each -- not a full re-enable every time.
+
+        A HELD stick is repeated by the UI at JOY_HOLD_INTERVAL_MS (app.js) and
+        each non-zero command here extends the deadman lease, so letting go --
+        or losing the frontend entirely -- stops the axis within
+        JOG_DEADMAN_TIMEOUT_S even if no stop command ever arrives. See
+        _enforce_jog_deadman.
+
+        seq is the UI's per-controller command counter, and it is what makes a
+        release win over an update that was already in flight. Requests arrive
+        on independent handler threads (ThreadingHTTPServer) and only serialise
+        on the Modbus lock, so a drag update posted 1-2 ms before the operator
+        let go could win that lock AFTER the release and leave its velocity
+        standing on the drive -- the "let go and it keeps driving" failure. The
+        seq is therefore checked and recorded under _jog_lock together with the
+        velocity write (see _accept_jog_order / _apply_jog_velocity): an update
+        that lost the race is dropped instead of being applied out of order.
+        Checking it on the way in would not be enough -- both threads could pass
+        the check and still reach their writes in the wrong order.
+
+        epoch identifies the UI session the seq belongs to; see
+        _accept_jog_order for why a bare counter is not enough."""
         try:
             velocity = int(round(float(velocity)))
         except (TypeError, ValueError):
@@ -1823,7 +1946,7 @@ class RailController:
 
         direction = (velocity > 0) - (velocity < 0)
         if direction == 0:
-            return self.jog_stop()
+            return self.jog_stop(seq, epoch)
         if self._down_locked(direction):
             return False, self.last_error
         if direction < 0 and self._down_position_blocked():
@@ -1842,18 +1965,77 @@ class RailController:
             if "jog_accel" in p and "jog_jerk" in p:
                 self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
 
-        if not self.set_target_velocity(velocity):
-            return False, self.last_error or "failed to set velocity"
-        self.jog_direction = direction
-        return True, "ok"
+        return self._apply_jog_velocity(velocity, direction, seq, epoch)
 
-    def jog_stop(self):
+    def _accept_jog_order(self, seq, epoch):
+        """Ordering gate for UI joystick commands: True if this one should be
+        applied. Call with _jog_lock held -- checking and recording has to be
+        atomic with the velocity write, or two threads both pass and still reach
+        the drive in the wrong order.
+
+        seq only orders commands within one UI SESSION (epoch), because a page
+        reload restarts the counter at 1: without the epoch a refreshed page
+        would have every command rejected against the old high-water mark, i.e. a
+        dead joystick. A command from a different epoch takes over and re-bases
+        the counter, so the most recently used tab owns the stick. Two tabs
+        dragging in the same instant would flip-flop epochs and lose the ordering
+        guarantee between them -- degenerate (one operator, one pointer), and no
+        worse than having no seq at all.
+
+        Commands with no seq -- curl, an older cached UI, and every internal stop
+        (end stop, travel limit, the deadman itself) -- are always applied."""
+        if seq is None:
+            return True
+        if epoch != self._jog_epoch:
+            self._jog_epoch = epoch          # new UI session takes over
+        elif self._jog_seq is not None and seq <= self._jog_seq:
+            return False
+        self._jog_seq = seq
+        return True
+
+    def _apply_jog_velocity(self, velocity, direction, seq, epoch):
+        """Commit a joystick command: the ordering check, the velocity write and
+        the deadman/direction bookkeeping, all under _jog_lock so concurrent
+        handler threads apply their commands one at a time and in seq order (see
+        jog_velocity). direction must be non-zero -- a release goes through
+        jog_stop, which holds the same lock."""
+        with self._jog_lock:
+            if not self._accept_jog_order(seq, epoch):
+                return True, "superseded by a newer command"
+            if not self.set_target_velocity(velocity):
+                return False, self.last_error or "failed to set velocity"
+            self.jog_direction = direction
+            # (Re)arm the deadman: this command is only good for
+            # JOG_DEADMAN_TIMEOUT_S unless the UI keeps repeating it.
+            self._jog_deadline = time.monotonic() + JOG_DEADMAN_TIMEOUT_S
+            self._jog_deadman_tripped = False
+            # Retract a previous timeout now that the axis is being driven
+            # again; anything else in there is someone else's error to clear.
+            if (self.last_error or "").startswith(JOG_DEADMAN_MESSAGE):
+                self.last_error = None
+            return True, "ok"
+
+    def jog_stop(self, seq=None, epoch=None):
         """Release jog: ramp to zero but stay in operation enabled so the next
-        press responds immediately."""
-        self.jog_direction = 0
-        if not self.set_target_velocity(0):
-            return False, self.last_error or "failed to stop jog"
-        return True, "ok"
+        press responds immediately. Disarms the manual-drive deadman -- there is
+        no longer a manual command standing that could go stale.
+
+        Shares _jog_lock (and, when the caller passes one, the seq ordering
+        check) with _apply_jog_velocity, so a release can never be undone by a
+        drag update that was still in flight when the operator let go.
+
+        Internal stops -- an end stop, the soft down limit, the deadman itself --
+        pass no seq and are therefore always applied; suppressing one of those
+        as 'stale' is never right."""
+        with self._jog_lock:
+            if not self._accept_jog_order(seq, epoch):
+                return True, "superseded by a newer command"
+            self.jog_direction = 0
+            self._jog_deadline = None
+            self._jog_deadman_tripped = False
+            if not self.set_target_velocity(0):
+                return False, self.last_error or "failed to stop jog"
+            return True, "ok"
 
     # -- lift-specific template -------------------------------------------
     # The readout above already works for the lift unchanged. These wrappers
@@ -2130,6 +2312,12 @@ class RailController:
             return False, self.last_error or "failed to enable drive"
         p = self.get_params()
         self._apply_motion_profile(p["pid_accel"], p["pid_jerk"])
+        # The PID loop is now the owner of the velocity command. Drop any
+        # manual-drive lease (and the direction a still-held joystick left
+        # behind) so the deadman cannot fire a zero velocity into the running
+        # loop -- jog_velocity refuses while the PID runs, so nothing re-arms it.
+        self.jog_direction = 0
+        self._jog_deadline = None
         self._pid_stop.clear()
         self._pid_thread = threading.Thread(target=self.run_pid_loop, daemon=True)
         self._pid_thread.start()
@@ -2605,7 +2793,19 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     GET  /api/state              -> live readout + params + flags for both
     POST /api/<name>/param       -> {key, value}
     POST /api/<name>/jog         -> {direction: -1|0|1}
-    POST /api/<name>/jog_velocity-> {velocity: signed rpm}  (joystick drive)
+    POST /api/<name>/jog_velocity-> {velocity: signed rpm, seq: int, epoch: str}
+                                     Joystick drive. A held stick must be
+                                     REPEATED (the UI does so every
+                                     JOY_HOLD_INTERVAL_MS) or the manual-drive
+                                     deadman stops the axis after
+                                     JOG_DEADMAN_TIMEOUT_S -- see
+                                     _enforce_jog_deadman. seq is a counter that
+                                     must increase within one epoch (a UI
+                                     session id); lower ones are dropped as
+                                     reordered stragglers (reported ok). Both
+                                     are optional -- but without them a release
+                                     can be overtaken by an update that was
+                                     still in flight. See _accept_jog_order.
     POST /api/<name>/jog_stop
     POST /api/<name>/stop
     POST /api/<name>/enable
@@ -2772,7 +2972,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
         if action == "jog":
             return ctrl.jog(body.get("direction", 0))
         if action == "jog_velocity":
-            return ctrl.jog_velocity(body.get("velocity", 0))
+            return ctrl.jog_velocity(body.get("velocity", 0), body.get("seq"),
+                                     body.get("epoch"))
         if action == "jog_stop":
             return ctrl.jog_stop()
         if action == "stop":
