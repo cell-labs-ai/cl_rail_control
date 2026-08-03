@@ -417,6 +417,14 @@ main {
 .param-row.slider-row .slider-head { display: flex; justify-content: space-between; }
 .param-row input[type="range"] { width: 100%; margin: 0.25rem 0; accent-color: var(--brand); }
 
+/* A param update that failed to reach the server (dropped connection, etc.) --
+   see flashFieldError in app.js. Title attribute carries the reason. */
+.param-row .field-error {
+  border-color: var(--status-error) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--status-error) 25%, transparent);
+}
+.param-row input[type="range"].field-error { accent-color: var(--status-error); }
+
 /* PID */
 .pid-actions { margin-top: 0.625rem; }
 .pid-toggle {

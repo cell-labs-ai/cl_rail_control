@@ -165,6 +165,26 @@ async function post(name, action, payload) {
   }
 }
 
+// A param edit that fails silently (e.g. a dropped connection mid-request)
+// looks identical to one that was never made -- the input just sits there
+// showing the value the operator typed. Flash the field red with the reason
+// so a lost request is visible instead of indistinguishable from success.
+function flashFieldError(input, message) {
+  clearTimeout(input._errTimer);
+  input.classList.add("field-error");
+  input.title = message || "update failed";
+  input._errTimer = setTimeout(() => {
+    input.classList.remove("field-error");
+    input.title = "";
+  }, 4000);
+}
+
+async function postParam(name, input, key, value) {
+  const res = await post(name, "param", { key, value });
+  if (!res.ok) flashFieldError(input, res.message);
+  return res;
+}
+
 // --- panel construction ---------------------------------------------------
 
 // A collapsed <details> disclosure that param rows get appended into.
@@ -193,7 +213,7 @@ function makeParamRow(name, spec) {
     }
     select.value = spec.default;
     select.addEventListener("change", () =>
-      post(name, "param", { key: spec.key, value: Number(select.value) }));
+      postParam(name, select, spec.key, Number(select.value)));
     row.append(label, select);
     return { row, input: select };
   }
@@ -208,7 +228,7 @@ function makeParamRow(name, spec) {
     if (spec.step !== undefined) input.step = spec.step;
     input.value = spec.default;
     input.addEventListener("change", () =>
-      post(name, "param", { key: spec.key, value: Number(input.value) }));
+      postParam(name, input, spec.key, Number(input.value)));
     row.append(label, input);
     return { row, input };
   }
@@ -232,7 +252,7 @@ function makeParamRow(name, spec) {
   input.value = spec.default;
   input.addEventListener("input", () => { val.textContent = input.value; });
   input.addEventListener("change", () =>
-    post(name, "param", { key: spec.key, value: Number(input.value) }));
+    postParam(name, input, spec.key, Number(input.value)));
   row.append(head, input);
   return { row, input, valEl: val };
 }
