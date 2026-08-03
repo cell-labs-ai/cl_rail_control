@@ -44,6 +44,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -2304,59 +2305,75 @@ class RailController:
         last_time = None
         next_tick = time.monotonic()
 
-        while not self._pid_stop.is_set():
-            state = self.get_state()
-            angle = self._read_angle()
-            p = self.get_params()
-            now = time.monotonic()
+        try:
+            while not self._pid_stop.is_set():
+                state = self.get_state()
+                angle = self._read_angle()
+                p = self.get_params()
+                now = time.monotonic()
 
-            if angle is not None:
-                error = PID_SETPOINT - angle
-                if abs(error) <= p["deadzone"]:
-                    error = 0
-                scale = self._rope_length_scale() if p["length_comp"] else 1.0
-                error *= scale
+                if angle is not None:
+                    error = PID_SETPOINT - angle
+                    if abs(error) <= p["deadzone"]:
+                        error = 0
+                    scale = self._rope_length_scale() if p["length_comp"] else 1.0
+                    error *= scale
 
-                if last_angle is not None and last_time is not None:
-                    dt = min(now - last_time, PID_MAX_DT_S)
-                    if dt > 0:
-                        raw_rate = (angle - last_angle) / dt
-                        alpha = dt / (PID_DERIVATIVE_TAU_S + dt)
-                        filtered_rate += alpha * (raw_rate - filtered_rate)
-                        if p["ki"] != 0:
-                            candidate = integral + error * dt
-                            if abs(p["ki"] * candidate) <= PID_INTEGRAL_LIMIT:
-                                integral = candidate
-                            integral -= integral * min(1.0, PID_INTEGRAL_LEAK_RATE * dt)
+                    if last_angle is not None and last_time is not None:
+                        dt = min(now - last_time, PID_MAX_DT_S)
+                        if dt > 0:
+                            raw_rate = (angle - last_angle) / dt
+                            alpha = dt / (PID_DERIVATIVE_TAU_S + dt)
+                            filtered_rate += alpha * (raw_rate - filtered_rate)
+                            if p["ki"] != 0:
+                                candidate = integral + error * dt
+                                if abs(p["ki"] * candidate) <= PID_INTEGRAL_LIMIT:
+                                    integral = candidate
+                                integral -= integral * min(1.0, PID_INTEGRAL_LEAK_RATE * dt)
 
-                last_angle = angle
-                last_time = now
+                    last_angle = angle
+                    last_time = now
 
-                velocity = -(p["kp"] * error
-                             + p["ki"] * integral
-                             + p["kd"] * filtered_rate * scale)
-                velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
-                if state.get("pos_limit") and velocity > 0:
-                    velocity = 0
-                if state.get("neg_limit") and velocity < 0:
-                    velocity = 0
+                    velocity = -(p["kp"] * error
+                                 + p["ki"] * integral
+                                 + p["kd"] * filtered_rate * scale)
+                    velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
+                    if state.get("pos_limit") and velocity > 0:
+                        velocity = 0
+                    if state.get("neg_limit") and velocity < 0:
+                        velocity = 0
 
-                if _quick_stop_active(state.get("status_word")):
-                    self._ensure_operation_enabled()
+                    if _quick_stop_active(state.get("status_word")):
+                        self._ensure_operation_enabled()
 
-                self.set_target_velocity(round(velocity))
+                    self.set_target_velocity(round(velocity))
 
-            next_tick += PID_INTERVAL_S
-            delay = next_tick - time.monotonic()
-            if delay <= 0:
-                # The bus round trips overran the interval: re-anchor and run
-                # the next iteration immediately rather than bursting to catch
-                # up.
-                next_tick = time.monotonic()
-                continue
-            self._pid_stop.wait(delay)
-
-        self.set_target_velocity(0)
+                next_tick += PID_INTERVAL_S
+                delay = next_tick - time.monotonic()
+                if delay <= 0:
+                    # The bus round trips overran the interval: re-anchor and run
+                    # the next iteration immediately rather than bursting to catch
+                    # up.
+                    next_tick = time.monotonic()
+                    continue
+                self._pid_stop.wait(delay)
+        except Exception as exc:
+            # An uncaught exception here (e.g. a WiFi/bus hiccup surfacing as
+            # a raised error rather than the graceful None/False _read/_write
+            # normally return) would otherwise kill this thread silently:
+            # pid_running stays True forever, the UI keeps showing "PID on",
+            # and the drive just holds its last commanded velocity while the
+            # load swings uncontrolled. Fail safe and visible instead.
+            print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} PID "
+                  f"loop crashed: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            self.last_error = f"PID stopped unexpectedly: {type(exc).__name__}: {exc}"
+            self.pid_running = False
+        finally:
+            try:
+                self.set_target_velocity(0)
+            except Exception:
+                pass
 
     # -- simulation --------------------------------------------------------
 
