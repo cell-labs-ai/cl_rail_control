@@ -21,6 +21,12 @@ const JOG_LABELS = {
 };
 const JOY_AXIS = { cart: "x", lift: "y" };
 
+// The cart's positive-velocity convention (rail_web_ui.py) drives it opposite
+// to what "right" looks like on screen -- multiply by this when converting
+// screen position to a command (rpm sent, rpm displayed), but NOT when
+// positioning the handle, so the stick still visually follows the pointer.
+const AXIS_SIGN = { cart: -1, lift: 1 };
+
 // Below this fraction of full travel the stick reads as centred (0). Keeps a
 // resting hand from creeping the drive.
 const JOY_DEADZONE = 0.06;
@@ -354,21 +360,25 @@ function makeJoystick(name, role) {
 
   function render(pos) {
     handle.style.setProperty("--pos", pos);
-    const rpm = Math.round(pos * joy.fullScale);
+    const rpm = Math.round(pos * AXIS_SIGN[role] * joy.fullScale);
     value.textContent = rpm === 0 ? "0 rpm" : `${rpm > 0 ? "+" : ""}${rpm} rpm`;
     value.classList.toggle("active", rpm !== 0);
   }
 
   // Fraction of full travel (clamped to [-1, 1]) for a pointer event, after
-  // deadzone and end-stop gating.
+  // deadzone and end-stop gating. This is screen position (right/up = +),
+  // used for the handle's visual placement -- see AXIS_SIGN for the command
+  // this turns into.
   function posFromEvent(e) {
     const r = track.getBoundingClientRect();
     let p = axis === "y"
       ? (r.top + r.height / 2 - e.clientY) / (r.height / 2)   // up = +
       : (e.clientX - (r.left + r.width / 2)) / (r.width / 2);  // right = +
     p = Math.max(-1, Math.min(1, p));
-    if (p > 0 && joy.limits.pos) p = 0;   // blocked by a triggered end stop
-    if (p < 0 && joy.limits.neg) p = 0;
+    // limits.pos/neg gate the actual command direction, not screen position.
+    const cmdSign = AXIS_SIGN[role] * p;
+    if (cmdSign > 0 && joy.limits.pos) p = 0;   // blocked by a triggered end stop
+    if (cmdSign < 0 && joy.limits.neg) p = 0;
     if (Math.abs(p) < JOY_DEADZONE) p = 0;
     return p;
   }
@@ -378,7 +388,7 @@ function makeJoystick(name, role) {
     e.preventDefault();
     const p = posFromEvent(e);
     render(p);
-    sender.hold(Math.round(p * joy.fullScale));
+    sender.hold(Math.round(p * AXIS_SIGN[role] * joy.fullScale));
   }
 
   // Spring back to centre and stop. Every way a hold can end funnels through
