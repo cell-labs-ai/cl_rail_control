@@ -442,6 +442,22 @@ main {
 }
 .pid-toggle.running { background: var(--status-warn); border-color: var(--status-warn); color: var(--neutral-950); }
 
+/* Live per-tick term breakdown while the loop runs -- see pid_debug in
+   rail_web_ui.py / renderPidDebug in app.js. Hidden while PID is off. */
+.pid-debug {
+  margin: 0.625rem 0 0;
+  padding: 0.5rem 0.625rem;
+  background: var(--input-bg);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: pre-wrap;
+}
+
 /* Readout */
 .readout { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 .readout td { padding: 0.3125rem 0.25rem; border-bottom: 1px solid var(--border-subtle); font-size: 0.8125rem; }

@@ -656,6 +656,14 @@ class RailController:
         self.jog_direction = 0              # -1, 0, +1
         self.pid_running = False
         self.last_error = None
+        # Live PID term breakdown (cart only), refreshed every run_pid_loop
+        # iteration so the UI can show what the loop actually computed rather
+        # than making the operator infer it from cart motion -- see
+        # run_pid_loop. None (all fields) while PID is not running. Replaced
+        # wholesale each tick rather than mutated in place, so a concurrent
+        # read of self.pid_debug never sees a half-updated dict (dict
+        # assignment is atomic under the GIL; no lock needed).
+        self.pid_debug = None
         # Serialises the moment a manual-drive command is committed
         # (_apply_jog_velocity / jog_stop), so the three fields above and the
         # target-velocity write move together -- without it, joystick updates
@@ -2334,9 +2342,10 @@ class RailController:
                     last_angle = angle
                     last_time = now
 
-                    velocity = -(p["kp"] * error
-                                 + p["ki"] * integral
-                                 + p["kd"] * filtered_rate * scale)
+                    p_term = p["kp"] * error
+                    i_term = p["ki"] * integral
+                    d_term = p["kd"] * filtered_rate * scale
+                    velocity = -(p_term + i_term + d_term)
                     velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
                     if state.get("pos_limit") and velocity > 0:
                         velocity = 0
@@ -2347,6 +2356,20 @@ class RailController:
                         self._ensure_operation_enabled()
 
                     self.set_target_velocity(round(velocity))
+
+                    # Snapshot of what this tick actually computed, for the
+                    # UI's PID debug readout -- see pid_debug in __init__.
+                    self.pid_debug = {
+                        "angle": angle,
+                        "error": round(error, 2),
+                        "p_term": round(p_term, 2),
+                        "i_term": round(i_term, 2),
+                        "d_term": round(d_term, 2),
+                        "velocity": round(velocity, 2),
+                        "kp": p["kp"],
+                        "ki": p["ki"],
+                        "kd": p["kd"],
+                    }
 
                 next_tick += PID_INTERVAL_S
                 delay = next_tick - time.monotonic()
@@ -2374,6 +2397,7 @@ class RailController:
                 self.set_target_velocity(0)
             except Exception:
                 pass
+            self.pid_debug = None
 
     # -- simulation --------------------------------------------------------
 
@@ -2824,6 +2848,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
                 "pid_length_scale": (round(ctrl._rope_length_scale(), 3)
                                      if ctrl.role == "cart" else None),
+                "pid_debug": ctrl.pid_debug,
                 "state": state,
                 "params": ctrl.get_params(),
             }

@@ -611,9 +611,26 @@ function buildPanel(ctrl) {
       posLimit: flagPosLimit,
     },
     pidToggle,
+    pidDebug: root.querySelector(".pid-debug"),   // null when there is no PID card
     walkRearm,
     errLine: root.querySelector(".err-line"),
   };
+}
+
+// PID debug is a live per-tick breakdown of what the loop just computed --
+// see pid_debug in rail_web_ui.py. null while PID isn't running.
+function renderPidDebug(el, debug) {
+  if (!el) return;
+  if (!debug) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.textContent =
+    `angle ${debug.angle}   error ${debug.error}\n` +
+    `P ${debug.p_term}   I ${debug.i_term}   D ${debug.d_term}   ` +
+    `→ ${debug.velocity} rpm\n` +
+    `kp ${debug.kp}   ki ${debug.ki}   kd ${debug.kd}`;
 }
 
 // --- live updates ---------------------------------------------------------
@@ -689,6 +706,7 @@ function updatePanel(name, data) {
     p.pidToggle.textContent = data.pid_running ? "Stop PID" : "Start PID";
     p.pidToggle.classList.toggle("running", data.pid_running);
   }
+  renderPidDebug(p.pidDebug, data.pid_debug);
 
   // Homing status (lift only). Until homed, the lift is UP-only: drive it up
   // into the top end stop to home (method 35). true = homed, in-progress =
