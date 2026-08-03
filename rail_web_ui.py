@@ -523,11 +523,11 @@ WALK_SPECS_LIFT = [
 # exposed in the UI; the gain defaults come straight from motion_test.py.
 PID_PARAM_SPECS = [
     {"key": "kp", "label": "Kp (rpm / digit)", "kind": "number", "group": "pid",
-     "default": -4.5, "min": -50, "max": 50, "step": 0.1, "software": True},
+     "default": 4.5, "min": -50, "max": 50, "step": 0.1, "software": True},
     {"key": "ki", "label": "Ki (rpm / digit*s)", "kind": "number", "group": "pid",
-     "default": -0.01, "min": -10, "max": 10, "step": 0.01, "software": True},
+     "default": 0.01, "min": -10, "max": 10, "step": 0.01, "software": True},
     {"key": "kd", "label": "Kd (rpm / digit/s)", "kind": "number", "group": "pid",
-     "default": -0.05, "min": -10, "max": 10, "step": 0.01, "software": True},
+     "default": 0.05, "min": -10, "max": 10, "step": 0.01, "software": True},
     {"key": "deadzone", "label": "Deadzone (digits)", "kind": "number", "group": "pid",
      "default": 15, "min": 0, "max": 200, "step": 1, "software": True},
     {"key": "max_speed", "label": "PID max speed (rpm)", "kind": "slider", "group": "pid",
@@ -2266,6 +2266,13 @@ class RailController:
         iteration, so the UI retunes it on the fly; the setpoint is fixed
         (PID_SETPOINT).
 
+        The overall sign is flipped relative to motion_test.py's convention
+        (velocity = -(Kp*error + ...) here vs. Kp*error + ... there) purely so
+        the UI's kp/ki/kd read as positive numbers -- motion_test.py's gains
+        are negative for the same physical response. Flipping the whole sum
+        instead of each term keeps every gain's relative sign (and hence the
+        loop's damping/windup behaviour) identical to motion_test.py's.
+
         With length_comp on, the deadzoned error and the derivative are both
         multiplied by the rope-length scale (_rope_length_scale), converting
         the angle terms into horizontal-offset terms up to a constant: the
@@ -2325,9 +2332,9 @@ class RailController:
                 last_angle = angle
                 last_time = now
 
-                velocity = (p["kp"] * error
-                            + p["ki"] * integral
-                            + p["kd"] * filtered_rate * scale)
+                velocity = -(p["kp"] * error
+                             + p["ki"] * integral
+                             + p["kd"] * filtered_rate * scale)
                 velocity = max(-p["max_speed"], min(p["max_speed"], velocity))
                 if state.get("pos_limit") and velocity > 0:
                     velocity = 0

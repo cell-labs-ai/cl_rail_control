@@ -49,7 +49,7 @@ fields.
           "software": true
         },
         { "key": "kp", "label": "Kp (rpm / digit)", "kind": "number", "group": "pid",
-          "default": -4.5, "min": -50, "max": 50, "step": 0.1, "software": true },
+          "default": 4.5, "min": -50, "max": 50, "step": 0.1, "software": true },
         { "key": "length_comp", "label": "Rope-length compensation", "kind": "select",
           "group": "pid", "default": 1,
           "options": [{ "value": 1, "label": "On" }, { "value": 0, "label": "Off" }] }
@@ -118,7 +118,7 @@ controller, keyed by controller `name`.
         "neg_limit": false,
         "pos_limit": false
       },
-      "params": { "jog_speed": 700, "jog_accel": 1000, "kp": -4.5, "...": "..." }
+      "params": { "jog_speed": 700, "jog_accel": 1000, "kp": 4.5, "...": "..." }
     },
     "lift": { "...": "same shape, role-appropriate fields" }
   }
