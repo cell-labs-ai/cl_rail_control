@@ -464,8 +464,8 @@ function buildPanel(ctrl) {
   const tpl = document.getElementById("panel-template").content.cloneNode(true);
   const root = tpl.querySelector(".panel");
   root.dataset.controller = name;
-  root.querySelector(".panel-title").textContent =
-    `${name} — …${ctrl.suffix}`;
+  root.querySelector(".panel-title-name").textContent = name;
+  root.querySelector(".panel-title-serial").textContent = `…${ctrl.suffix}`;
 
   const inputs = {};
   const valEls = {};
