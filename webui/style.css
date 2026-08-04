@@ -173,16 +173,18 @@ main {
 }
 .panel-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
+  gap: 0.35rem 1rem;
   padding: 1rem 1.25rem;
   border-bottom: 1px solid var(--border-subtle);
   background: var(--surface);
 }
-.panel-title { margin: 0; display: flex; flex-direction: column; gap: 0.1rem; }
+.panel-title { margin: 0; flex-shrink: 0; display: flex; flex-direction: column; gap: 0.1rem; }
 .panel-title-name { font-size: 1rem; font-weight: 600; text-transform: capitalize; color: var(--text); }
-.panel-title-serial { font-size: 0.7rem; font-weight: 400; color: var(--text-muted); }
-.panel-flags { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.panel-title-serial { font-size: 0.7rem; font-weight: 400; color: var(--text-muted); white-space: nowrap; }
+.panel-flags { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: flex-end; }
 
 .flag {
   display: inline-block;
