@@ -102,6 +102,7 @@ controller, keyed by controller `name`.
       "heartbeat_ok": true,
       "last_error": null,
       "walk_status": null,
+      "top_move_status": null,
       "down_limit_active": false,
       "pid_length_scale": 1.0,
       "state": {
@@ -125,8 +126,8 @@ controller, keyed by controller `name`.
 }
 ```
 
-- `homing_complete` / `homing_in_progress` / `walk_status` are lift-only
-  (`null`/`false` on the cart).
+- `homing_complete` / `homing_in_progress` / `walk_status` /
+  `top_move_status` are lift-only (`null`/`false` on the cart).
 - `state` values are `null` when a read failed or the field doesn't apply to
   that role (e.g. `digital_outputs` on the cart, `analog_input_1` on the
   lift).
@@ -150,6 +151,7 @@ JSON (may be `{}`). Response is always
 | `enable` | `{}` | enable the drive without commanding motion |
 | `pid` | `{"action": "start"\|"stop"}` | cart only — start/stop the software balance loop |
 | `lift` | `{"direction": "up"\|"down"}` | lift-only templated move (see file header — not fully wired to real kinematics yet) |
+| `drive_to_top` | `{}` | lift-only — one-click move up to the top end stop at the average allowed joy speed, see "Drive to top" below |
 | `walk_rearm` | `{}` | lift-only — re-arm the Walking-mode sequence after a fall catch/abort |
 | `sim_fall` | `{}` | simulate-mode + lift-only test hook, not relevant to real hardware |
 
@@ -190,6 +192,23 @@ functionality" goal:
   (or pass `null`) and every command is just applied in arrival order,
   which is fine for a first cut but reintroduces the "let go and it keeps
   driving for a moment" race under bad network conditions.
+
+## Drive to top (`drive_to_top`, lift only)
+
+The counterpart to the joystick for the one move that always has the same
+destination: `POST /api/lift/drive_to_top` (body `{}`) drives the lift **up at
+the average allowed joy speed** — the middle of the `jog_speed` param's
+`min`/`max` from `/api/config`, i.e. 275 rpm as shipped — until the top end
+stop, then parks it there (drive disabled, load on the closed brake), which is
+also where an unhomed lift homes itself.
+
+Unlike `jog_velocity` this is **fire-and-forget**: the move runs server-side,
+needs no repeats, and is *not* covered by the deadman. Follow it via
+`top_move_status` in `/api/state` (`null` while idle | `"driving"` | `"at top"` |
+`"aborted"`, reason in `last_error`) and interrupt it with `POST
+/api/lift/stop` — a `jog_velocity` command or a mode switch also takes it over.
+The existing UI grays its "To top" button out while `"driving"` and while
+`state.pos_limit` is set.
 
 ## Readout decoding
 

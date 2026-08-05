@@ -533,6 +533,17 @@ function buildPanel(ctrl) {
 
   root.querySelector(".estop").addEventListener("click", () => post(name, "stop", {}));
 
+  // Drive-to-top (lift only): one click, no held stick -- the move runs
+  // server-side until the top end stop (see start_drive_to_top in
+  // rail_web_ui.py), so the button just fires and then reflects top_move_status.
+  let goTop = root.querySelector(".go-top");
+  if (ctrl.role !== "lift") {
+    goTop.remove();
+    goTop = null;
+  } else {
+    goTop.addEventListener("click", () => post(name, "drive_to_top", {}));
+  }
+
   // Walking-mode re-arm (lift only): restart the walk sequence once the
   // robot has recovered. Kept visible (but disabled) throughout Walking mode
   // so the operator knows the option exists; hidden entirely in Basic.
@@ -612,6 +623,7 @@ function buildPanel(ctrl) {
     },
     pidToggle,
     pidDebug: root.querySelector(".pid-debug"),   // null when there is no PID card
+    goTop,
     walkRearm,
     errLine: root.querySelector(".err-line"),
   };
@@ -778,6 +790,17 @@ function updatePanel(name, data) {
   p.flags.negLimit.classList.toggle("on-limit", !!state.neg_limit);
   p.flags.posLimit.textContent = state.pos_limit ? "POS ENDSTOP" : "pos endstop";
   p.flags.posLimit.classList.toggle("on-limit", !!state.pos_limit);
+
+  // Drive-to-top button (lift only). Locked out while the move runs -- STOP is
+  // the way to interrupt it, as for the Walking-mode sequence -- and while the
+  // lift already sits on the top end stop, where there is nothing left to do.
+  if (p.goTop) {
+    const goingUp = data.top_move_status === "driving";
+    p.goTop.classList.toggle("running", goingUp);
+    p.goTop.disabled = goingUp || !!state.pos_limit;
+    p.goTop.querySelector(".go-top-label").textContent =
+      goingUp ? "going up…" : (state.pos_limit ? "at top" : "To top");
+  }
 
   // Block driving further into a triggered end stop; the opposite direction
   // stays available so the cart can be driven back off it. The joystick reads

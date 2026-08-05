@@ -19,7 +19,9 @@ UI repeats it and the drive stops itself when the repeats stop, so a lost
 release still stops the axis (see JOG_DEADMAN_TIMEOUT_S). The CART carries joy
 max speed, accel/jerk and the PID gains (Kp/Ki/Kd) with a start/stop for the
 software balance loop; the LIFT has joy max speed only -- no accel/jerk, no
-PID, no analog-angle readout.
+PID, no analog-angle readout. Beside its joystick the LIFT also has a one-click
+"to top" button: a server-side move up to the top end stop at the average
+allowed joy speed (see start_drive_to_top).
 
 The CART is fully wired up. The LIFT reuses the readout and its motion is
 templated (lift_up / lift_down): the same generic Profile Velocity move, with
@@ -201,6 +203,18 @@ SIM_FALL_ACCEL_RPM_S = 800
 # _sim_current), so the touchdown detector fires and the whole sequence is
 # exercisable without hardware.
 SIM_GROUND_POSITION = -2000
+# Simulate only: the lift's top end stop -- the position (6064h counts) where the
+# fake positive limit switch trips. 0 because that IS the home reference, taken
+# at the top stop (see check_homing). Driving up into it clamps the fake drum and
+# reports the switch, so everything that keys on it works without hardware: the
+# joystick's end-stop gating and the drive-to-top move's arrival check (which
+# would otherwise never finish in simulate).
+SIM_TOP_POSITION = 0
+# Simulate only: where the fake lift hangs at startup -- halfway down, so BOTH
+# directions have travel to exercise (and the top end stop reads clear at boot):
+# the Walking-mode descent to SIM_GROUND_POSITION, the drive-to-top move up to
+# SIM_TOP_POSITION.
+SIM_LIFT_START_POSITION = SIM_GROUND_POSITION // 2
 # Simulate only: stand-ins for the current-limit physics. The fake payload
 # "needs" SIM_LIFT_HOLD_CURRENT_MA to be lifted: with 2031h below that, upward
 # motion stalls at the taut-rope position (SIM_GROUND_POSITION); at 0 the drum
@@ -351,6 +365,32 @@ VELOCITY_ZERO_RPM = 5
 # Assumes downward travel DECREASES the count (home = top, down = negative
 # velocity), so travel is blocked once position <= this. None disables it.
 LIFT_DOWN_POSITION_LIMIT = -120000
+
+# Lift only: the one-click "drive to top" move (see start_drive_to_top), the
+# button next to the lift's joystick. Drives UP at the AVERAGE ALLOWED velocity
+# -- the middle of the joy-speed slider's range, see _mid_range -- until the top
+# end stop, then parks the lift there exactly like the STOP button does (drive
+# disabled, load on the closed brake). That is also the position the lift homes
+# at, so this doubles as "go home" on an unhomed lift (see
+# _maybe_home_at_endstop).
+#
+# Autonomous, unlike the joystick: there is no held stick to renew a deadman
+# lease, so the move is bounded by the top end stop, by the timeout below, and
+# by the same takeover paths as the Walking-mode descent (STOP, a joystick
+# command, a mode switch, a walk start). The connection watchdog (see
+# OD_HEARTBEAT) still halts the drive if this process or the WiFi link dies
+# mid-move.
+#
+# One check per interval off the poller's cached snapshot -- no extra bus
+# traffic; 10 Hz means the stop is commanded within ~100 ms of the end stop
+# triggering, and the drive has quick-stopped on the switch by itself long
+# before that.
+DRIVE_TO_TOP_POLL_INTERVAL_S = 0.1
+# A move that has neither reached the top nor been taken over within this long
+# is aborted (stop, brake closed) -- covers a missing/failed end stop switch
+# with the drive still happily turning. Generous enough for the full travel at
+# half the joy-speed range from the lowest point.
+DRIVE_TO_TOP_TIMEOUT_S = 180.0
 
 # _walk_to_operation_enabled() steps the CiA-402 state machine one confirmed
 # transition at a time. The timeout must cover the lift's automatic brake
@@ -549,6 +589,18 @@ PARAM_SPECS_BY_ROLE = {
     "lift": JOG_SPECS_LIFT + WALK_SPECS_LIFT,
 }
 
+
+def _mid_range(specs, key):
+    """The middle of a parameter's ALLOWED range (not its current value) --
+    e.g. the average allowed joy speed, which is what the lift's drive-to-top
+    move runs at. Derived from the schema so retuning the slider's min/max moves
+    it too. 0 if the parameter doesn't exist or has no range."""
+    spec = next((s for s in specs if s["key"] == key), None)
+    if spec is None or "min" not in spec or "max" not in spec:
+        return 0
+    return int(round((spec["min"] + spec["max"]) / 2))
+
+
 # PID loop constants not exposed as tunable params (from motion_test.py). The
 # setpoint is the middle of the analog range (rail centre), matching
 # POSITION_SETPOINT in motion_test.py.
@@ -650,6 +702,14 @@ class RailController:
         self.walk_status = None
         self._walk_thread = None
         self._walk_stop = threading.Event()
+        # Lift only: the one-click drive-to-top move (see start_drive_to_top).
+        # top_move_status is surfaced to the UI ("driving" | "at top" |
+        # "aborted", None while idle); the stop event cancels a running move,
+        # and every path that takes the axis over sets it too, so the move
+        # thread can never fight another command.
+        self.top_move_status = None
+        self._top_thread = None
+        self._top_stop = threading.Event()
 
         # Drive / status flags surfaced to the UI.
         self.drive_enabled = False          # Profile Velocity mode + operation enabled
@@ -714,7 +774,9 @@ class RailController:
         self._sim_current_limit = None
         self._sim_falling = False
         self._sim_velocity = 0.0
-        self._sim_position = 0.0
+        # The fake lift hangs halfway, not at its top end stop -- see
+        # SIM_LIFT_START_POSITION.
+        self._sim_position = float(SIM_LIFT_START_POSITION) if role == "lift" else 0.0
         self._sim_angle = ANALOG_INPUT_MAX / 2
         self._sim_target_velocity = 0.0
         self._sim_last = time.monotonic()
@@ -751,6 +813,7 @@ class RailController:
     def stop(self):
         self.stop_pid()
         self._cancel_walk()
+        self._cancel_top_move()
         if self.connected and not self._simulate:
             try:
                 self.stop_motor()
@@ -899,11 +962,14 @@ class RailController:
 
         Lift only: entering Walking starts the auto-lower (the lift DRIVES
         DOWN, if homed -- see start_walk_lower); leaving it cancels a descent
-        still in progress (the walk thread stops the motor, brake closed)."""
+        still in progress (the walk thread stops the motor, brake closed).
+        Either way a drive-to-top move in progress is cancelled -- a mode switch
+        takes the axis over."""
         previous, self.mode = self.mode, mode
         self._idle_since = None
         if self.role != "lift" or mode == previous:
             return
+        self._cancel_top_move()
         if mode == MODE_WALKING:
             self.start_walk_lower()
         else:
@@ -1058,6 +1124,7 @@ class RailController:
                                "Walking mode")
             return False, self.last_error
         self._cancel_walk()               # serialise with a previous descent
+        self._cancel_top_move()           # ... and with a drive-to-top move
         self._walk_stop.clear()
         # Drop any manual-drive lease before the walk thread starts driving:
         # the descent sets jog_direction itself, and a deadline left over from
@@ -1678,10 +1745,11 @@ class RailController:
         following jog from reading a stale 'Operation enabled', skipping its
         enable walk and writing a target velocity the still-running disable
         discards -- a jog press that does nothing."""
-        # A STOP overrides a running auto-lower: flag it so the walk thread
-        # exits instead of re-commanding its descent velocity. No join here --
-        # the walk thread itself calls stop_motor() on touchdown/abort.
+        # A STOP overrides a running auto-lower or drive-to-top move: flag both
+        # so their threads exit instead of re-commanding a velocity. No join
+        # here -- those threads call stop_motor() themselves on arrival/abort.
         self._walk_stop.set()
+        self._top_stop.set()
         self.jog_direction = 0
         self._jog_deadline = None       # no manual command left to time out
         if self._simulate:
@@ -1792,10 +1860,11 @@ class RailController:
             return self.jog_stop()
         if self.pid_running:
             return False, "stop the PID loop before jogging"
-        # Manual drive overrides a running Walking-mode auto-lower; the join
-        # inside guarantees the walk thread has stopped commanding velocities
-        # first.
+        # Manual drive overrides a running Walking-mode auto-lower or
+        # drive-to-top move; the joins inside guarantee those threads have
+        # stopped commanding velocities first.
         self._cancel_walk()
+        self._cancel_top_move()
         if self._down_locked(direction):
             return False, self.last_error
         if direction < 0 and self._down_position_blocked():
@@ -1849,8 +1918,10 @@ class RailController:
             return False, f"invalid velocity {velocity!r}"
         if self.pid_running:
             return False, "stop the PID loop before jogging"
-        # Manual drive overrides a running Walking-mode auto-lower (see jog()).
+        # Manual drive overrides a running Walking-mode auto-lower or
+        # drive-to-top move (see jog()).
         self._cancel_walk()
+        self._cancel_top_move()
 
         # Clamp so the stick can never command more than the configured
         # maximum.
@@ -2212,6 +2283,145 @@ class RailController:
         # behaviour so the payload can't free-fall.
         return self.jog(-1)
 
+    # -- lift-specific: one-click drive to the top -------------------------
+
+    def _cancel_top_move(self, wait=True):
+        """Cancel a running drive-to-top move -- the sibling of _cancel_walk:
+        set the stop event (the move thread stops the motor and exits within a
+        poll interval) and, with wait=True from another thread, join it, so a
+        command taking over provably has the move thread out of the way before
+        commanding velocities of its own."""
+        self._top_stop.set()
+        thread = self._top_thread
+        if (wait and thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()):
+            thread.join(timeout=2)
+
+    def start_drive_to_top(self):
+        """Lift only: drive UP to the top end stop at the average allowed joy
+        speed and park there. One click, no held stick -- see the
+        DRIVE_TO_TOP_POLL_INTERVAL_S block for what bounds it instead. Runs in
+        the background (_run_drive_to_top); returns (ok, message).
+
+        Up is never travel-locked (it is how an unhomed lift reaches its home
+        reference), so unlike the auto-lower this does not require homing --
+        and stopping on the end stop is exactly what lets the poller home the
+        lift there (_maybe_home_at_endstop).
+
+        Overrides a Walking-mode sequence like a manual jog does: _cancel_walk()
+        joins the walk thread, whose finally restores Max Motor Current (2031h)
+        -- driving up while that is still clamped low could not lift the payload
+        at all."""
+        if self.role != "lift":
+            return False, "drive to top is lift-only"
+        if self.pid_running:
+            return False, "stop the PID loop before driving to the top"
+        if self.get_state().get("pos_limit"):
+            self.top_move_status = "at top"
+            return True, "already at the top end stop"
+        speed = _mid_range(self.param_specs, "jog_speed")
+        if speed <= 0:
+            return False, "no drive-to-top speed available from the joy-speed range"
+        self._cancel_walk()
+        self._cancel_top_move()           # serialise with a previous move
+        self._top_stop.clear()
+        # Drop any manual-drive lease before the move thread starts driving: a
+        # deadline left over from a jog moments ago would otherwise expire into
+        # the move and stop it (see start_walk_lower).
+        self._jog_deadline = None
+        self.top_move_status = "driving"
+        self.last_error = None
+        self._top_thread = threading.Thread(
+            target=self._run_drive_to_top, args=(speed,), daemon=True)
+        self._top_thread.start()
+        return True, f"driving up to the top at {speed} rpm"
+
+    def _top_abort(self, message):
+        """Stop the motion (brake closed) and surface why the drive-to-top move
+        did not get there. Runs on the move thread."""
+        self.stop_motor()
+        self.top_move_status = "aborted"
+        self.last_error = f"drive to top: {message}"
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive to top "
+              f"aborted: {message}")
+
+    def _run_drive_to_top(self, speed):
+        """Drive up at `speed` until the lift is at the top end stop, then park
+        it there like the STOP button does (drive disabled, load on the closed
+        brake) -- which is also what lets the poller home an unhomed lift on the
+        spot.
+
+        Arrival is the positive limit switch (60FDh bit 1) or the drive
+        quick-stopping itself on that switch, whichever the drive's Quick Stop
+        Option Code (605Ah) produces. Checked BEFORE the takeover checks
+        below, because a quick stop reads there as "someone else took the axis":
+        _sync_drive_flags clears drive_enabled / jog_direction as soon as the
+        poller sees the drive leave Operation enabled, so a cancellation check
+        first would exit without ever reporting that the lift arrived.
+
+        The quick-stop half of that arrives ARMED only once Operation enabled
+        has actually been observed: the poller snapshot can still hold the
+        pre-enable statusword of a lift that was sitting in 'Quick stop active'
+        (a triggered end stop) when the move started, and reading that as
+        arrival would report "at top" from wherever the lift happens to be. The
+        limit-switch half needs no arming -- start_drive_to_top refuses when it
+        is already set.
+
+        Aborts (stop, brake closed): the drive leaving Operation enabled for any
+        other reason -- a fault, the connection watchdog -- and
+        DRIVE_TO_TOP_TIMEOUT_S. Exits QUIETLY, without re-stopping, when someone
+        else took over (STOP, a joystick command, a mode switch, a walk start)."""
+        if not self._ensure_operation_enabled():
+            self._top_abort(self.last_error or "could not enable drive")
+            return
+        if not self.set_target_velocity(speed):
+            self._top_abort(self.last_error or "could not set velocity")
+            return
+        self.jog_direction = 1
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive to top: "
+              f"driving up at {speed} rpm (average allowed joy speed) until the "
+              f"top end stop")
+
+        armed = False
+        deadline = time.monotonic() + DRIVE_TO_TOP_TIMEOUT_S
+        while True:
+            state = self.get_state()
+            status_word = state.get("status_word")
+            enabled = _operation_enabled(status_word)
+            armed = armed or enabled
+
+            if state.get("pos_limit") or (armed and _quick_stop_active(status_word)):
+                # At the top. stop_motor() leaves the holding state so the load
+                # ends up on the brake rather than on motor current.
+                ok = self.stop_motor()
+                self.top_move_status = "at top"
+                print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive "
+                      f"to top: top end stop reached -- stopped, brake closed")
+                if not ok:
+                    self.last_error = ("drive to top: reached the top but the "
+                                       f"stop failed -- {self.last_error}")
+                return
+
+            if self._top_stop.is_set() or self.jog_direction != 1:
+                # STOP, a joystick command, a mode switch or a walk start took
+                # over: stop only if this thread's own command is still the
+                # active one (a STOP has already stopped; a pending jog stops us
+                # first and then takes over).
+                if self.drive_enabled and self.jog_direction == 1:
+                    self.stop_motor()
+                self.top_move_status = None
+                return
+
+            if armed and not enabled:
+                self._top_abort("drive left Operation enabled "
+                                f"({_decode_cia402_state(status_word)})")
+                return
+            if time.monotonic() >= deadline:
+                self._top_abort("timed out before reaching the top end stop -- "
+                                "check the positive limit switch")
+                return
+            self._top_stop.wait(DRIVE_TO_TOP_POLL_INTERVAL_S)
+
     # -- software PID balance loop (from motion_test.run_position_control) --
 
     def start_pid(self):
@@ -2449,6 +2659,16 @@ class RailController:
         # Integrate velocity into a fake position actual value (6064h).
         self._sim_position += self._sim_velocity * dt
 
+        # Lift only: the fake top end stop (see SIM_TOP_POSITION). Driving up
+        # into it stops the drum and trips the positive limit switch; the drive
+        # stays "enabled" here rather than modelling a quick stop, which the
+        # end-stop consumers do not need.
+        pos_limit = (self.role == "lift"
+                     and self._sim_position >= SIM_TOP_POSITION)
+        if pos_limit:
+            self._sim_position = SIM_TOP_POSITION
+            self._sim_velocity = min(0.0, self._sim_velocity)
+
         # Pendulum-ish angle: driven by velocity, plus a slow idle sway.
         self._sim_angle += -self._sim_velocity * dt * 0.05
         self._sim_angle += math.sin(now * 0.7) * 2.0 * dt
@@ -2459,7 +2679,9 @@ class RailController:
         # Brake (60FEh:01h bit 0) tracks the drive: released while enabled,
         # closed when idle, so the sim shows the bit toggling.
         digital_outputs = 0 if self.drive_enabled else (1 << DIGITAL_OUTPUT_BIT_BRAKE)
-        # No physical limit switches to simulate; report both clear.
+        # 60FDh: only the lift's fake top end stop is modelled (bit 1); nothing
+        # simulates the negative one.
+        digital_inputs = (1 << DIGITAL_INPUT_BIT_POS_LIMIT) if pos_limit else 0
         return {
             "status_word": status_word,
             "position_actual": int(self._sim_position),
@@ -2468,13 +2690,13 @@ class RailController:
             "error_count": 0,
             "analog_input_1": int(self._sim_angle),
             "control_word": 0x000F if self.drive_enabled else 0x0006,
-            "digital_inputs": 0,
+            "digital_inputs": digital_inputs,
             "digital_outputs": digital_outputs,
             # Actual Current (2039h:05h) in mA; roughly velocity-proportional,
             # collapsing below the fake ground (see _sim_current).
             "motor_current": self._sim_current(),
             "neg_limit": False,
-            "pos_limit": False,
+            "pos_limit": pos_limit,
         }
 
 
@@ -2756,6 +2978,13 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     POST /api/<name>/enable
     POST /api/<name>/pid         -> {action: "start"|"stop"}
     POST /api/<name>/lift        -> {direction: "up"|"down"|"stop"}  (lift only)
+    POST /api/lift/drive_to_top  -> one-click move: drive UP at the average
+                                     allowed joy speed until the top end stop,
+                                     then park there (drive disabled, brake
+                                     closed). Lift only; runs server-side, so
+                                     unlike jog_velocity it needs no repeats --
+                                     STOP (or a joystick command) interrupts it.
+                                     See start_drive_to_top.
     POST /api/lift/walk_rearm    -> re-run the Walking-mode sequence after a
                                      fall catch / abort (Walking mode only)
     POST /api/lift/sim_fall      -> start a fake fall (simulate mode only;
@@ -2845,6 +3074,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
                 "walk_status": ctrl.walk_status,
+                "top_move_status": ctrl.top_move_status,
                 "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
                 "pid_length_scale": (round(ctrl._rope_length_scale(), 3)
                                      if ctrl.role == "cart" else None),
@@ -2955,6 +3185,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             if direction == "down":
                 return ctrl.lift_down()
             return ctrl.jog_stop()
+        if action == "drive_to_top":
+            return ctrl.start_drive_to_top()
         if action == "walk_rearm":
             return ctrl.rearm_walk()
         if action == "sim_fall":

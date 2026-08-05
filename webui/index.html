@@ -58,7 +58,15 @@
         <!-- Manual drive (spring-return joystick built by app.js) -->
         <div class="card drive-card">
           <h3>Manual drive</h3>
-          <div class="joy-mount"></div>
+          <div class="drive-row">
+            <div class="joy-mount"></div>
+            <!-- Lift only (app.js drops it for the cart): one click drives the
+                 lift up to the top end stop at the average allowed speed. -->
+            <button class="go-top" title="Drive the lift all the way up to the top end stop, at the average allowed speed. STOP interrupts it.">
+              <span class="go-top-icon">⤒</span>
+              <span class="go-top-label">To top</span>
+            </button>
+          </div>
           <button class="estop">STOP</button>
           <!-- Lift only: visible in Walking mode; grayed while the walk
                sequence is running, enabled to restart it after a fall catch
