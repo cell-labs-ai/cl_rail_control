@@ -21,7 +21,9 @@ max speed, accel/jerk and the PID gains (Kp/Ki/Kd) with a start/stop for the
 software balance loop; the LIFT has joy max speed only -- no accel/jerk, no
 PID, no analog-angle readout. Beside its joystick the LIFT also has a one-click
 "to top" button: a server-side move up to the top end stop at the average
-allowed joy speed (see start_drive_to_top).
+allowed joy speed, easing off to a creep for the last stretch so it settles onto
+the stop as gently as a hand on the joystick does (see start_drive_to_top and
+_top_approach_speed).
 
 The CART is fully wired up. The LIFT reuses the readout and its motion is
 templated (lift_up / lift_down): the same generic Profile Velocity move, with
@@ -215,6 +217,12 @@ SIM_TOP_POSITION = 0
 # the Walking-mode descent to SIM_GROUND_POSITION, the drive-to-top move up to
 # SIM_TOP_POSITION.
 SIM_LIFT_START_POSITION = SIM_GROUND_POSITION // 2
+# Simulate only: DRIVE_TO_TOP_SLOWDOWN_COUNTS scaled to the fake rig, whose whole
+# travel (SIM_GROUND_POSITION) is 2000 counts against the real 120000. With the
+# real slowdown distance the sim lift would be inside the ramp from the moment it
+# starts and the drive-to-top move would creep end to end -- the ramp itself
+# would never be exercised without hardware.
+SIM_DRIVE_TO_TOP_SLOWDOWN_COUNTS = 700
 # Simulate only: stand-ins for the current-limit physics. The fake payload
 # "needs" SIM_LIFT_HOLD_CURRENT_MA to be lifted: with 2031h below that, upward
 # motion stalls at the taut-rope position (SIM_GROUND_POSITION); at 0 the drum
@@ -368,11 +376,11 @@ LIFT_DOWN_POSITION_LIMIT = -120000
 
 # Lift only: the one-click "drive to top" move (see start_drive_to_top), the
 # button next to the lift's joystick. Drives UP at the AVERAGE ALLOWED velocity
-# -- the middle of the joy-speed slider's range, see _mid_range -- until the top
-# end stop, then parks the lift there exactly like the STOP button does (drive
-# disabled, load on the closed brake). That is also the position the lift homes
-# at, so this doubles as "go home" on an unhomed lift (see
-# _maybe_home_at_endstop).
+# -- the middle of the joy-speed slider's range, see _mid_range -- easing off to
+# a creep for the last stretch (see _top_approach_speed) until the top end stop,
+# then parks the lift there exactly like the STOP button does (drive disabled,
+# load on the closed brake). That is also the position the lift homes at, so this
+# doubles as "go home" on an unhomed lift (see _maybe_home_at_endstop).
 #
 # Autonomous, unlike the joystick: there is no held stick to renew a deadman
 # lease, so the move is bounded by the top end stop, by the timeout below, and
@@ -381,16 +389,72 @@ LIFT_DOWN_POSITION_LIMIT = -120000
 # OD_HEARTBEAT) still halts the drive if this process or the WiFi link dies
 # mid-move.
 #
-# One check per interval off the poller's cached snapshot -- no extra bus
-# traffic; 10 Hz means the stop is commanded within ~100 ms of the end stop
-# triggering, and the drive has quick-stopped on the switch by itself long
-# before that.
+# One check per interval off the poller's cached snapshot -- no extra bus traffic
+# for the checks themselves; 10 Hz means the stop is commanded within ~100 ms of
+# the end stop triggering, and the drive has quick-stopped on the switch by itself
+# long before that. The same interval paces the approach ramp's target-velocity
+# writes, which are the move's only bus traffic (a handful over the ramp, see
+# DRIVE_TO_TOP_SPEED_STEP_RPM).
 DRIVE_TO_TOP_POLL_INTERVAL_S = 0.1
-# A move that has neither reached the top nor been taken over within this long
-# is aborted (stop, brake closed) -- covers a missing/failed end stop switch
-# with the drive still happily turning. Generous enough for the full travel at
-# half the joy-speed range from the lowest point.
-DRIVE_TO_TOP_TIMEOUT_S = 180.0
+# Soft arrival at the top. Running into the end stop at the full move speed makes
+# the drive quick-stop from ~275 rpm, which is the harsh jolt the joystick never
+# produces: by hand the operator eases off near the top and the drive ramps down.
+# So the move does the same thing -- full speed while the top is far away, then a
+# linear ramp down over the last DRIVE_TO_TOP_SLOWDOWN_COUNTS to a creep, the
+# speed the switch is actually touched at (see _top_approach_speed). Distance to
+# the top is home-relative: homed at the top means 6064h reads 0 there and
+# negative below.
+#
+# The slowdown distance is in 6064h counts and tuned against the rig's travel
+# (LIFT_DOWN_POSITION_LIMIT, 120000 counts): ~1/8 of it. Longer = gentler but
+# more of the move spent crawling. The creep speed is the SLOWEST speed the
+# joystick is allowed to command (the jog_speed slider's minimum, 50 rpm as
+# shipped, see _min_range) -- schema-derived like the move speed itself, and by
+# definition a speed the drive turns this axis at smoothly under load.
+DRIVE_TO_TOP_SLOWDOWN_COUNTS = 15000
+# Target velocities on the ramp are quantised to this, so the 10 Hz loop rewrites
+# 60FFh a handful of times across the ramp instead of every cycle. The drive
+# smooths each step with its own configured accel/decel ramp (the lift carries no
+# accel/jerk params of its own -- see JOG_SPECS_LIFT), so the steps are not felt.
+DRIVE_TO_TOP_SPEED_STEP_RPM = 5
+# The most upward travel (6064h counts) the move can legitimately need before the
+# top end stop must have triggered: the configured down travel plus slack for an
+# unhomed lift left parked below it. Past that the switch is missing or dead, so
+# the move aborts (stop, brake closed) instead of reeling the payload into the
+# drum. This is the real end-stop net -- in the distance that matters, wherever
+# the move started -- and it is what lets DRIVE_TO_TOP_TIMEOUT_S below be
+# generous enough for a blind creep. None (net off, timeout only) when there is no
+# configured travel to derive it from.
+DRIVE_TO_TOP_MAX_TRAVEL_COUNTS = (None if LIFT_DOWN_POSITION_LIMIT is None
+                                  else abs(LIFT_DOWN_POSITION_LIMIT) + 30000)
+# The same net for a HOMED lift, where the top is a known position (0 counts) and
+# no travel sum is needed: how far above it the lift may get before the missing
+# switch is called. Slack for a home reference that has drifted a little, small
+# enough to catch the dead switch well before the payload reaches the drum.
+DRIVE_TO_TOP_OVERRUN_COUNTS = 5000
+# Arriving at the top, WAIT for the drum to come to rest before the drive is
+# disabled (see _top_settle). The other half of the abrupt arrival, and the half
+# the joystick never has: a stick release writes zero velocity and stays in
+# Operation enabled, so the axis ramps down on the drive's own profile and the
+# brake is not touched at all (it closes minutes later, at rest, via
+# _maybe_idle_stop). The move parks the load right away instead, and Disable
+# operation runs the drive's automatic brake-close sequence (2038h) -- issued
+# while the drum is still turning, that lands the brake on a moving load.
+#
+# Bounded, because the settle is a courtesy and parking the load is not: when the
+# axis will not read stationary (a jammed rope, an unreadable 606Ch) the stop goes
+# ahead anyway rather than leaving the load hanging on drive current. Generous
+# enough for a ramp down from the creep speed plus the drive's own quick stop.
+DRIVE_TO_TOP_SETTLE_TIMEOUT_S = 2.0
+DRIVE_TO_TOP_SETTLE_POLL_S = 0.02
+# A move that has neither reached the top nor been taken over within this long is
+# aborted (stop, brake closed). Now only the backstop for a lift that is not
+# getting anywhere at all -- a stalled drum, a jammed rope, a switch that failed
+# while 6064h is unreadable -- since a switch failure with a live position readout
+# is caught by DRIVE_TO_TOP_MAX_TRAVEL_COUNTS long before the clock runs out.
+# Generous enough for the worst legitimate case: the full travel at the creep
+# speed, which is what an UNHOMED move runs at end to end (_top_approach_speed).
+DRIVE_TO_TOP_TIMEOUT_S = 600.0
 
 # _walk_to_operation_enabled() steps the CiA-402 state machine one confirmed
 # transition at a time. The timeout must cover the lift's automatic brake
@@ -590,15 +654,29 @@ PARAM_SPECS_BY_ROLE = {
 }
 
 
-def _mid_range(specs, key):
-    """The middle of a parameter's ALLOWED range (not its current value) --
-    e.g. the average allowed joy speed, which is what the lift's drive-to-top
-    move runs at. Derived from the schema so retuning the slider's min/max moves
-    it too. 0 if the parameter doesn't exist or has no range."""
+def _range_bounds(specs, key):
+    """(min, max) of a parameter's ALLOWED range -- its schema bounds, not its
+    current value. None if the parameter doesn't exist or has no range."""
     spec = next((s for s in specs if s["key"] == key), None)
     if spec is None or "min" not in spec or "max" not in spec:
-        return 0
-    return int(round((spec["min"] + spec["max"]) / 2))
+        return None
+    return spec["min"], spec["max"]
+
+
+def _mid_range(specs, key):
+    """The middle of a parameter's ALLOWED range -- e.g. the average allowed joy
+    speed, which is what the lift's drive-to-top move runs at. Derived from the
+    schema so retuning the slider's min/max moves it too. 0 if unavailable."""
+    bounds = _range_bounds(specs, key)
+    return 0 if bounds is None else int(round((bounds[0] + bounds[1]) / 2))
+
+
+def _min_range(specs, key):
+    """The bottom of a parameter's ALLOWED range -- e.g. the slowest allowed joy
+    speed, which is what the drive-to-top move creeps onto the end stop at.
+    Schema-derived like _mid_range; 0 if unavailable."""
+    bounds = _range_bounds(specs, key)
+    return 0 if bounds is None else int(bounds[0])
 
 
 # PID loop constants not exposed as tunable params (from motion_test.py). The
@@ -2299,9 +2377,11 @@ class RailController:
 
     def start_drive_to_top(self):
         """Lift only: drive UP to the top end stop at the average allowed joy
-        speed and park there. One click, no held stick -- see the
-        DRIVE_TO_TOP_POLL_INTERVAL_S block for what bounds it instead. Runs in
-        the background (_run_drive_to_top); returns (ok, message).
+        speed, easing to a creep for the last stretch so the lift settles onto
+        the stop instead of slamming into it, and park there. One click, no held
+        stick -- see the DRIVE_TO_TOP_POLL_INTERVAL_S block for what bounds it
+        instead. Runs in the background (_run_drive_to_top); returns
+        (ok, message).
 
         Up is never travel-locked (it is how an unhomed lift reaches its home
         reference), so unlike the auto-lower this does not require homing --
@@ -2322,6 +2402,11 @@ class RailController:
         speed = _mid_range(self.param_specs, "jog_speed")
         if speed <= 0:
             return False, "no drive-to-top speed available from the joy-speed range"
+        # The final-approach speed, clamped to the move speed so a
+        # (mis)configured slider range can never make the "creep" the faster of
+        # the two, and floored at 1 rpm so a range starting at 0 still creeps
+        # rather than sitting still waiting for the timeout.
+        creep = max(1, min(speed, _min_range(self.param_specs, "jog_speed")))
         self._cancel_walk()
         self._cancel_top_move()           # serialise with a previous move
         self._top_stop.clear()
@@ -2332,9 +2417,10 @@ class RailController:
         self.top_move_status = "driving"
         self.last_error = None
         self._top_thread = threading.Thread(
-            target=self._run_drive_to_top, args=(speed,), daemon=True)
+            target=self._run_drive_to_top, args=(speed, creep), daemon=True)
         self._top_thread.start()
-        return True, f"driving up to the top at {speed} rpm"
+        return True, (f"driving up to the top at {speed} rpm, easing to "
+                      f"{creep} rpm at the stop")
 
     def _top_abort(self, message):
         """Stop the motion (brake closed) and surface why the drive-to-top move
@@ -2345,11 +2431,103 @@ class RailController:
         print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive to top "
               f"aborted: {message}")
 
-    def _run_drive_to_top(self, speed):
-        """Drive up at `speed` until the lift is at the top end stop, then park
-        it there like the STOP button does (drive disabled, load on the closed
-        brake) -- which is also what lets the poller home an unhomed lift on the
-        spot.
+    def _top_slowdown_counts(self):
+        """How far below the top the drive-to-top move starts easing off
+        (DRIVE_TO_TOP_SLOWDOWN_COUNTS), scaled down on a simulated lift whose
+        whole travel is shorter than the real ramp -- see
+        SIM_DRIVE_TO_TOP_SLOWDOWN_COUNTS."""
+        return (SIM_DRIVE_TO_TOP_SLOWDOWN_COUNTS if self._simulate
+                else DRIVE_TO_TOP_SLOWDOWN_COUNTS)
+
+    def _top_approach_speed(self, position, fast, creep):
+        """The speed a drive-to-top move should be running at from `position`
+        (6064h): `fast` while the top is more than DRIVE_TO_TOP_SLOWDOWN_COUNTS
+        away, then a linear ramp down to `creep` -- the speed the end stop is
+        meant to be TOUCHED at -- so the lift eases onto the stop the way the
+        operator does it by hand on the joystick.
+
+        Distance is home-relative: the home reference is taken AT the top end
+        stop, so a homed lift reads 0 there and negative below (the same
+        convention _rope_length_scale uses), which makes -position what is left
+        to travel.
+
+        With no trustworthy distance -- an UNHOMED lift, or a 6064h read that
+        failed -- the whole move creeps: the stop can arrive at any moment, and
+        touching it gently is worth more than getting there quickly. That is the
+        homing move, so it happens once after power-up (and the joystick is still
+        there for a quick trip up).
+
+        Quantised to DRIVE_TO_TOP_SPEED_STEP_RPM and clamped into
+        [creep, fast]."""
+        if not self.homing_complete or position is None:
+            return creep
+        slowdown = self._top_slowdown_counts()
+        remaining = -position
+        if remaining >= slowdown:
+            return fast
+        if remaining <= 0:
+            return creep            # at or past the homed top: creep onto the stop
+        speed = creep + (fast - creep) * (remaining / slowdown)
+        step = DRIVE_TO_TOP_SPEED_STEP_RPM
+        return max(creep, min(fast, int(round(speed / step) * step)))
+
+    def _top_settle(self):
+        """Bring the drum to a stop and confirm it BEFORE the caller disables the
+        drive, so the holding brake closes on a standing axis instead of catching
+        a moving one -- see the DRIVE_TO_TOP_SETTLE_TIMEOUT_S block for why the
+        joystick needs none of this. Runs on the move thread; True if the axis
+        read stationary, False on the timeout (the caller stops regardless).
+
+        Zero velocity is written here rather than left to stop_motor() so the
+        deceleration happens while the drive is still in Operation enabled, on its
+        configured ramp -- exactly what a stick release does.
+
+        606Ch is read straight off the bus, not taken from the 10 Hz poller
+        snapshot, which could be a full interval stale and report standstill while
+        the drum is still turning (the same reason the fall watch reads it
+        directly). |606Ch| <= VELOCITY_ZERO_RPM is 'stopped', as everywhere else
+        (see _resting_on_endstop).
+
+        Waits on _top_stop rather than sleeping, so a takeover arriving mid-settle
+        (a STOP, a joystick command -- each of which joins this thread) does not
+        sit through the remaining wait: it gives up on the gentle stop and lets
+        the caller park the axis immediately."""
+        self.set_target_velocity(0)
+        deadline = time.monotonic() + DRIVE_TO_TOP_SETTLE_TIMEOUT_S
+        while time.monotonic() < deadline:
+            velocity = self._read_velocity_rpm()
+            if velocity is not None and abs(velocity) <= VELOCITY_ZERO_RPM:
+                return True
+            if self._top_stop.wait(DRIVE_TO_TOP_SETTLE_POLL_S):
+                return False
+        return False
+
+    def _top_overrun(self, position, start_position):
+        """True when a drive-to-top move has travelled up past the point where
+        the top end stop MUST have triggered, i.e. the switch is missing or dead
+        (see DRIVE_TO_TOP_MAX_TRAVEL_COUNTS). Two references, whichever is known:
+        for a homed lift the top itself is 0 counts, so anything more than
+        DRIVE_TO_TOP_OVERRUN_COUNTS above it is already an overrun; unhomed there
+        is no such reference, but the move still cannot need more than the rig's
+        travel from where it started.
+
+        False whenever there is nothing to compare -- 6064h unreadable, or an
+        unhomed lift on a rig with no configured travel; DRIVE_TO_TOP_TIMEOUT_S is
+        the backstop for those."""
+        if position is None or start_position is None:
+            return False
+        if self.homing_complete:
+            return position > DRIVE_TO_TOP_OVERRUN_COUNTS
+        if DRIVE_TO_TOP_MAX_TRAVEL_COUNTS is None:
+            return False
+        return position - start_position > DRIVE_TO_TOP_MAX_TRAVEL_COUNTS
+
+    def _run_drive_to_top(self, fast, creep):
+        """Drive up until the lift is at the top end stop -- at `fast` until the
+        last stretch, then ramping down to `creep` for the arrival itself (see
+        _top_approach_speed) -- then park it there like the STOP button does
+        (drive disabled, load on the closed brake), which is also what lets the
+        poller home an unhomed lift on the spot.
 
         Arrival is the positive limit switch (60FDh bit 1) or the drive
         quick-stopping itself on that switch, whichever the drive's Quick Stop
@@ -2368,19 +2546,29 @@ class RailController:
         is already set.
 
         Aborts (stop, brake closed): the drive leaving Operation enabled for any
-        other reason -- a fault, the connection watchdog -- and
-        DRIVE_TO_TOP_TIMEOUT_S. Exits QUIETLY, without re-stopping, when someone
-        else took over (STOP, a joystick command, a mode switch, a walk start)."""
+        other reason -- a fault, the connection watchdog -- an overrun past where
+        the end stop must have been (_top_overrun) and DRIVE_TO_TOP_TIMEOUT_S.
+        Exits QUIETLY, without re-stopping, when someone else took over (STOP, a
+        joystick command, a mode switch, a walk start)."""
         if not self._ensure_operation_enabled():
             self._top_abort(self.last_error or "could not enable drive")
             return
+        start_position = self.get_state().get("position_actual")
+        speed = self._top_approach_speed(start_position, fast, creep)
         if not self.set_target_velocity(speed):
             self._top_abort(self.last_error or "could not set velocity")
             return
         self.jog_direction = 1
+        if speed > creep:
+            approach = (f", easing to {creep} rpm over the last "
+                        f"{self._top_slowdown_counts()} counts")
+        elif not self.homing_complete:
+            approach = (" -- creeping the whole way, the top's distance is "
+                        "unknown until the lift is homed")
+        else:
+            approach = " -- already inside the slowdown distance"
         print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive to top: "
-              f"driving up at {speed} rpm (average allowed joy speed) until the "
-              f"top end stop")
+              f"driving up at {speed} rpm until the top end stop{approach}")
 
         armed = False
         deadline = time.monotonic() + DRIVE_TO_TOP_TIMEOUT_S
@@ -2391,12 +2579,20 @@ class RailController:
             armed = armed or enabled
 
             if state.get("pos_limit") or (armed and _quick_stop_active(status_word)):
-                # At the top. stop_motor() leaves the holding state so the load
-                # ends up on the brake rather than on motor current.
+                # At the top -- and, thanks to the approach ramp, arriving at the
+                # creep speed rather than at full tilt. Settle first, THEN
+                # stop_motor(): the settle is what keeps the brake off a still
+                # turning drum, and stop_motor() leaves the holding state so the
+                # load ends up on the brake rather than on motor current.
+                settled = self._top_settle()
                 ok = self.stop_motor()
                 self.top_move_status = "at top"
+                rest = ("stopped" if settled else
+                        "standstill not confirmed within "
+                        f"{DRIVE_TO_TOP_SETTLE_TIMEOUT_S:.0f}s")
                 print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} drive "
-                      f"to top: top end stop reached -- stopped, brake closed")
+                      f"to top: top end stop reached at {speed} rpm -- {rest}, "
+                      f"brake closed")
                 if not ok:
                     self.last_error = ("drive to top: reached the top but the "
                                        f"stop failed -- {self.last_error}")
@@ -2416,10 +2612,31 @@ class RailController:
                 self._top_abort("drive left Operation enabled "
                                 f"({_decode_cia402_state(status_word)})")
                 return
+            position = state.get("position_actual")
+            if self._top_overrun(position, start_position):
+                self._top_abort(f"drove up to {position} counts without the top "
+                                "end stop triggering -- check the positive limit "
+                                "switch")
+                return
             if time.monotonic() >= deadline:
                 self._top_abort("timed out before reaching the top end stop -- "
                                 "check the positive limit switch")
                 return
+
+            # Ease off as the top comes up: one target-velocity write per step of
+            # the ramp, none at all while the speed is unchanged (which is most
+            # cycles -- see DRIVE_TO_TOP_SPEED_STEP_RPM). A write that fails is
+            # not fatal here: the previous, always-higher target is still
+            # standing, so the move keeps going and the next cycle retries; only
+            # a failure that persists to the end stop costs the soft arrival.
+            target = self._top_approach_speed(position, fast, creep)
+            if target != speed and self.set_target_velocity(target):
+                speed = target
+                if target == creep:
+                    print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} "
+                          f"drive to top: creeping onto the end stop at "
+                          f"{creep} rpm")
+
             self._top_stop.wait(DRIVE_TO_TOP_POLL_INTERVAL_S)
 
     # -- software PID balance loop (from motion_test.run_position_control) --

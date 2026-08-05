@@ -151,7 +151,7 @@ JSON (may be `{}`). Response is always
 | `enable` | `{}` | enable the drive without commanding motion |
 | `pid` | `{"action": "start"\|"stop"}` | cart only — start/stop the software balance loop |
 | `lift` | `{"direction": "up"\|"down"}` | lift-only templated move (see file header — not fully wired to real kinematics yet) |
-| `drive_to_top` | `{}` | lift-only — one-click move up to the top end stop at the average allowed joy speed, see "Drive to top" below |
+| `drive_to_top` | `{}` | lift-only — one-click move up to the top end stop at the average allowed joy speed, creeping onto the stop, see "Drive to top" below |
 | `walk_rearm` | `{}` | lift-only — re-arm the Walking-mode sequence after a fall catch/abort |
 | `sim_fall` | `{}` | simulate-mode + lift-only test hook, not relevant to real hardware |
 
@@ -201,6 +201,28 @@ the average allowed joy speed** — the middle of the `jog_speed` param's
 `min`/`max` from `/api/config`, i.e. 275 rpm as shipped — until the top end
 stop, then parks it there (drive disabled, load on the closed brake), which is
 also where an unhomed lift homes itself.
+
+**Soft arrival.** The last stretch is not driven at that speed: from 15000
+counts below the top (`DRIVE_TO_TOP_SLOWDOWN_COUNTS`) the target velocity ramps
+linearly down to the **slowest allowed joy speed** — the `jog_speed` `min`, 50
+rpm as shipped — which is the speed the end stop is actually touched at, so the
+lift settles onto it instead of quick-stopping from full speed. Distance to the
+top is home-relative (homed at the top ⇒ `position_actual` is 0 there, negative
+below), so an **unhomed** lift, which cannot know how far the top is, creeps the
+whole way instead; that is the once-per-power-up homing move. A lift that drives
+more than 5000 counts past a homed top — or, unhomed, further than the rig's
+whole travel — aborts on the missing end-stop switch (see
+`_top_approach_speed` / `_top_overrun` for both nets).
+
+The arrival itself then **waits for the drum to stop** before the drive is
+disabled (`_top_settle`), because Disable operation runs the drive's automatic
+brake-close sequence: commanded while the axis is still turning, the holding
+brake catches a moving load. This is the second half of what made a one-click
+arrival harsher than a joystick one — releasing the stick never disables the
+drive at all, it just ramps to zero and stays enabled, and the brake only closes
+later at rest via the idle auto-stop. The wait is bounded (2 s) and a takeover
+cuts it short; the park then goes ahead either way, so the load never stays
+hanging on drive current.
 
 Unlike `jog_velocity` this is **fire-and-forget**: the move runs server-side,
 needs no repeats, and is *not* covered by the deadman. Follow it via
