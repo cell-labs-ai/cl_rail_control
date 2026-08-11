@@ -232,6 +232,27 @@ needs no repeats, and is *not* covered by the deadman. Follow it via
 The existing UI grays its "To top" button out while `"driving"` and while
 `state.pos_limit` is set.
 
+## Idle auto-stop
+
+The server stops an axis on its own when the drive is holding it (`Operation
+enabled`, or `Quick stop active` after a triggered end stop) with nothing
+moving — no commanded jog direction and `velocity_actual` within ±5 rpm — for
+longer than the axis's idle window:
+
+| axis | window | applies |
+|---|---|---|
+| `lift` | **120 s** (`LIFT_IDLE_STOP_TIMEOUT_S`) | `basic` mode only — in `walking` the sequence holds the axis deliberately |
+| `cart` | **300 s** (`CART_IDLE_STOP_TIMEOUT_S`) | every mode, except while the PID balance loop runs |
+
+The effect is identical to `POST /api/<controller>/stop` (lift: drive disabled,
+load on the closed brake; cart: drive disabled, no brake to close). Neither
+window ever runs while the lift is homing.
+
+For an integrating UI this means `drive_enabled` can go `false` with no command
+from you: after a stick release the axis stays enabled and merely ramps to zero,
+so an idle panel will eventually show the drive disabled. Nothing needs
+re-arming — the next `jog_velocity` re-enables the drive on its own.
+
 ## Readout decoding
 
 `readout[].fmt` from `/api/config` tells you how to render a `state` value

@@ -94,7 +94,11 @@ LIFT_SERIAL_SUFFIX = "0173"   # payload lift (template)
 #                (which must be homed): lower until the motor current says the
 #                payload has grounded, reel the slack taut at limited current,
 #                then drop to zero torque and watch the drum for a fall. Full
-#                sequence in _run_walk_lower. No idle auto-stop in this mode.
+#                sequence in _run_walk_lower. No idle auto-stop on the LIFT in
+#                this mode -- the sequence holds the axis deliberately.
+#
+# The CART's own idle auto-stop is NOT mode-gated (nothing on the cart is): it
+# runs in every mode, see _idle_stop_timeout.
 
 MODE_BASIC = "basic"
 MODE_WALKING = "walking"
@@ -104,11 +108,22 @@ OPERATING_MODES = [
 ]
 DEFAULT_MODE = MODE_BASIC
 
-# Basic mode, lift only: with the drive holding the axis but no up/down
-# movement -- neither commanded (jog_direction) nor actual (|606Ch| above the
-# standstill threshold) -- for this long, stop like the STOP button does (see
-# stop_motor: ramp to zero, leave the holding state, brake closed).
+# Idle auto-stop: with the drive holding the axis but nothing moving -- neither
+# commanded (jog_direction) nor actual (|606Ch| above the standstill threshold)
+# -- for this long, stop like the STOP button does (see stop_motor: ramp to
+# zero, leave the holding state, brake closed). See _maybe_idle_stop, and
+# _idle_stop_timeout for when each applies.
+#
+# Per role, because the wait costs different things. On the LIFT the payload
+# hangs on motor current the whole time, so the window is short. The CART only
+# sits energized, which costs nothing but heat -- its timeout is long enough
+# that an operator stepping away between moves finds the stick still live, and
+# is there to keep a drive from being left enabled for a whole day.
+#
+# The cart has NO holding brake (unlike the lift): stopping leaves the axis free
+# rather than locked, exactly as its STOP button already does.
 LIFT_IDLE_STOP_TIMEOUT_S = 120.0
+CART_IDLE_STOP_TIMEOUT_S = 300.0
 
 # Manual-drive deadman. A joystick hold is a LEASE, not a latch: the UI repeats
 # the current stick velocity every JOY_HOLD_INTERVAL_MS (app.js) while the
@@ -770,7 +785,7 @@ class RailController:
         # ControllerManager.set_mode(). Gates mode-specific behaviour (for now
         # the lift's idle auto-stop).
         self.mode = DEFAULT_MODE
-        # Monotonic time since when the lift has been enabled but motionless
+        # Monotonic time since when this axis has been enabled but motionless
         # (see _maybe_idle_stop); None while moving / not applicable.
         self._idle_since = None
         # Walking-mode sequence (lift only, see _run_walk_lower). walk_status
@@ -1021,8 +1036,8 @@ class RailController:
             engagement in jog_velocity) and writes target velocities into a drive
             that is ignoring them -- the stick looks dead until the operator
             crosses zero;
-          * the lift's idle auto-stop keeps counting a stale jog_direction as
-            "still being driven" and never times out (see _maybe_idle_stop).
+          * the idle auto-stop keeps counting a stale jog_direction as "still
+            being driven" and never times out (see _maybe_idle_stop).
 
         Only ever CLEARS, and only what a command path had confirmed: the
         enable paths set drive_enabled themselves once their walk has landed,
@@ -1035,8 +1050,8 @@ class RailController:
 
     def set_mode(self, mode):
         """Apply the system-wide operating mode to this controller. The idle
-        timer restarts, so a mode switch always grants a fresh
-        LIFT_IDLE_STOP_TIMEOUT_S window.
+        timer restarts, so a mode switch always grants a fresh idle window (see
+        _idle_stop_timeout).
 
         Lift only: entering Walking starts the auto-lower (the lift DRIVES
         DOWN, if homed -- see start_walk_lower); leaving it cancels a descent
@@ -1054,29 +1069,57 @@ class RailController:
             self._walk_stop.set()
             self.walk_status = None
 
+    def _idle_stop_timeout(self):
+        """How long this axis may hold still while enabled before the idle
+        auto-stop fires (see _maybe_idle_stop), or None when the watchdog does
+        not apply right now.
+
+        Role by role, since the two have different reasons to be left enabled:
+
+          * lift -- LIFT_IDLE_STOP_TIMEOUT_S, Basic mode ONLY. Walking mode's
+            sequence deliberately parks the drum at zero velocity, torqueless,
+            for as long as the robot walks; that is the fall catch standing
+            guard, and it reads exactly like an idle axis from here.
+          * cart -- CART_IDLE_STOP_TIMEOUT_S, in every mode (no mode gates
+            anything on the cart), except while the PID balance loop runs: a
+            settled loop commands near-zero velocity around a hanging load that
+            is not swinging, so the watchdog would disable the drive out from
+            under a loop that then keeps writing velocities into a dead axis.
+
+        Homing is excluded either way (lift only in practice): its enable must
+        not be yanked mid-procedure."""
+        if self.homing_in_progress:
+            return None
+        if self.role == "lift":
+            return LIFT_IDLE_STOP_TIMEOUT_S if self.mode == MODE_BASIC else None
+        if self.role == "cart":
+            return None if self.pid_running else CART_IDLE_STOP_TIMEOUT_S
+        return None
+
     def _maybe_idle_stop(self, snapshot):
-        """Basic mode, lift only: stop the drive like the STOP button does
-        (brake closed) after LIFT_IDLE_STOP_TIMEOUT_S with no up or down
-        movement -- 'movement' being a commanded jog direction or an actual
-        velocity (606Ch) above the standstill threshold, so a joystick still
-        driving the lift somewhere keeps the timer at bay.
+        """Stop a drive that is holding its axis with nothing moving, exactly
+        as its STOP button does (see stop_motor), once the role's idle window
+        has passed without movement -- 'movement' being a commanded jog
+        direction or an actual velocity (606Ch) above the standstill threshold,
+        so a joystick still driving the axis somewhere keeps the timer at bay.
+        Which window applies, and whether one applies at all, is
+        _idle_stop_timeout's call.
 
         Armed off the drive state the poller just READ -- not the cached
         drive_enabled flag -- and for every state in which the drive is still
         holding the axis:
 
-          * 'Operation enabled': brake open, load on motor current. The case
-            this watchdog exists for.
-          * 'Quick stop active': where a triggered end stop leaves the lift --
+          * 'Operation enabled': brake open (lift), load on motor current. The
+            case this watchdog exists for.
+          * 'Quick stop active': where a triggered end stop leaves the axis --
             braked on the way in, but still energized and holding. Nothing here
             commanded that transition, so keying on the cached flag instead used
             to switch the idle stop off for good on hitting an end stop.
 
         An unreadable statusword holds the timer where it is rather than
-        restarting it, so a flaky read cannot keep postponing the stop. Never
-        fires during homing, whose enable must not be yanked mid-procedure."""
-        if (self.role != "lift" or self.mode != MODE_BASIC
-                or self.homing_in_progress):
+        restarting it, so a flaky read cannot keep postponing the stop."""
+        timeout = self._idle_stop_timeout()
+        if timeout is None:
             self._idle_since = None
             return
         status_word = snapshot.get("status_word")
@@ -1092,16 +1135,18 @@ class RailController:
         if moving or self._idle_since is None:
             self._idle_since = now
             return
-        if now - self._idle_since < LIFT_IDLE_STOP_TIMEOUT_S:
+        if now - self._idle_since < timeout:
             return
         self._idle_since = None
+        # The cart has no holding brake, so say what the stop actually leaves
+        # behind on each axis rather than promising a brake that isn't there.
+        parked = "brake closed" if self.role == "lift" else "drive disabled"
         print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: no movement "
-              f"for {LIFT_IDLE_STOP_TIMEOUT_S:.0f}s in Basic mode "
-              f"({_decode_cia402_state(status_word)}) -- auto-stop "
-              f"(brake closed)")
+              f"for {timeout:.0f}s ({_decode_cia402_state(status_word)}) "
+              f"-- auto-stop ({parked})")
         if not self.stop_motor():
             # Say so on the console too: the line above must not be the last
-            # word if the payload is in fact still on motor current. The timer
+            # word if the axis is in fact still on motor current. The timer
             # restarts, so the next window retries.
             print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
                   f"auto-stop FAILED -- {self.last_error}")
@@ -1897,8 +1942,8 @@ class RailController:
 
         A blocked request also RELEASES a jog still running in that direction.
         Leaving jog_direction pointing at the blocked direction told the rest
-        of the system the operator was still driving -- which kept the lift's
-        idle auto-stop from ever timing out (see _maybe_idle_stop) while the
+        of the system the operator was still driving -- which kept the idle
+        auto-stop from ever timing out (see _maybe_idle_stop) while the
         joystick was held into the end stop -- and left the last target
         velocity standing on the drive, ready to execute the moment it recovers
         out of 'Quick stop active'."""
