@@ -1224,7 +1224,7 @@ class RailController:
         first = not self._jog_deadman_tripped
         self._jog_deadman_tripped = True
         self.jog_timeout_epoch = self._jog_epoch
-        ok, _message = self.jog_stop()      # clears _jog_deadline
+        ok, _message = self.jog_stop()      # clears _jog_deadline on success
         reason = (f"{JOG_DEADMAN_MESSAGE} (no update for "
                   f"{JOG_DEADMAN_TIMEOUT_S:.2f}s) -- ")
         if ok:
@@ -1632,12 +1632,15 @@ class RailController:
         """Lift only: soft lower travel limit. If the lift is moving down and
         has reached LIFT_DOWN_POSITION_LIMIT, command a stop. This has to catch
         it live because a held joystick keeps a steady down velocity with no
-        further commands to gate."""
+        further commands to gate. A failed stop leaves jog_direction pointing
+        down (see jog_stop), so the next poll tries again."""
         if self.jog_direction >= 0:
             return
         if self._down_position_blocked(snapshot.get("position_actual")):
-            self.jog_stop()
-            self.last_error = "lower travel limit reached -- stopped"
+            ok, _message = self.jog_stop()
+            self.last_error = ("lower travel limit reached -- stopped" if ok else
+                               "lower travel limit reached -- STOP FAILED, "
+                               f"retrying: {self.last_error}")
 
     def _maybe_home_at_endstop(self, snapshot):
         """Lift only: while the lift is not yet homed, watch for it resting on
@@ -2174,8 +2177,11 @@ class RailController:
     def _jog_lease_owner(self):
         """The UI session (epoch) holding a live joystick lease on this axis,
         or None -- no manual drive standing, a command without an epoch, or a
-        lease that has already expired."""
+        lease that has already expired. A lease the deadman has timed out
+        counts as expired even while it is still retrying a failed stop (which
+        re-arms _jog_deadline): nobody is driving it any more."""
         if (self.jog_direction == 0 or self._jog_deadline is None
+                or self._jog_deadman_tripped
                 or time.monotonic() >= self._jog_deadline):
             return None
         return self._jog_epoch
@@ -2265,16 +2271,25 @@ class RailController:
         drag update that was still in flight when the operator let go. Internal
         stops -- an end stop, the soft down limit, the deadman itself -- pass
         no seq and are therefore always applied; suppressing one as 'stale' is
-        never right."""
+        never right.
+
+        The manual-drive bookkeeping is only cleared once the zero velocity
+        has actually been written. If the write fails, the old velocity is
+        still standing on the drive, so jog_direction and the lease stay as
+        they were and the poll-driven stops come round again: the deadman
+        retries every poll once the lease has run out (a failed release
+        included), and the soft down limit re-fires while jog_direction still
+        points down. Clearing them up front made all of those believe the axis
+        was already stopped -- the deadman's 'retrying' never retried."""
         with self._jog_lock:
             refusal = self._accept_jog_order(seq, epoch, 0)
             if refusal is not None:
                 return refusal
+            if not self.set_target_velocity(0):
+                return False, self.last_error or "failed to stop jog"
             self.jog_direction = 0
             self._jog_deadline = None
             self._jog_deadman_tripped = False
-            if not self.set_target_velocity(0):
-                return False, self.last_error or "failed to stop jog"
             return True, "ok"
 
     # -- lift-specific template ------------------------------------------- The
