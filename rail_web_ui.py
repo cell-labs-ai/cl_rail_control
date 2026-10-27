@@ -152,6 +152,37 @@ JOG_DEADMAN_TIMEOUT_S = 0.35
 # sit in the UI's error line over an axis that is being driven normally again.
 # Other errors (end stop, travel limit) are left alone.
 JOG_DEADMAN_MESSAGE = "manual drive timed out"
+# How long a successful deadman stop stays in last_error before the poller
+# clears it on its own. last_error is shared by every connected UI, so a
+# timeout caused by one device dropping off WiFi would otherwise sit on every
+# OTHER operator's screen until somebody drives that axis again -- reading as
+# if the whole panel were in error. A stop that FAILED stays: that one is
+# actionable.
+JOG_DEADMAN_MESSAGE_HOLD_S = 5.0
+
+# Late-command filter for the joystick (see _jog_latency). A device whose WiFi
+# drops keeps queuing joystick posts; when the link comes back, TCP delivers
+# the backlog seconds late, and every one of those stale non-zero commands
+# would renew the deadman lease -- driving the axis on input the operator gave
+# long ago. Each UI post therefore carries the page's own clock (sent, ms of
+# performance.now()); the server learns each page's clock offset from its
+# fastest delivery and drops a drive command that arrived more than this much
+# later than that. Equal to the lease: a command older than the lease it
+# grants is worthless anyway. Releases (velocity 0) are never dropped as late
+# -- stopping is always safe.
+JOG_MAX_LATENCY_S = JOG_DEADMAN_TIMEOUT_S
+# Clock-rate allowance for the offset learning above: the browser's and this
+# host's clocks are free-running crystals, and if the browser's runs slow its
+# apparent offset creeps up for good -- with a fixed minimum, a long session
+# would eventually see every command as "late". The learned minimum is allowed
+# to rise by this much per second of wall time (1000 ppm, ~10x a cheap
+# crystal's error), which only loosens the threshold by 1 ms per second of an
+# outage, while a backlog's lateness grows a full second per second.
+JOG_CLOCK_DRIFT_ALLOWANCE = 1e-3
+# How many UI sessions' clock offsets to remember (oldest dropped first). Must
+# cover a device that drops out while others carry on, so its backlog is still
+# recognised as late when it reconnects.
+JOG_CLOCK_SESSIONS_MAX = 16
 
 # Walking mode, part 1: auto-lower (see _run_walk_lower). Descent speed and
 # touchdown current threshold are lift params (WALK_SPECS_LIFT) so they can be
@@ -832,11 +863,22 @@ class RailController:
         # True once the deadman has fired for the current lease, so a stop that
         # keeps failing (dead link) retries silently, not at the poll rate.
         self._jog_deadman_tripped = False
+        # Monotonic time at which a successful deadman stop's last_error is
+        # cleared again (see JOG_DEADMAN_MESSAGE_HOLD_S); None = nothing to
+        # clear.
+        self._jog_deadman_clear_at = None
+        # UI session (epoch) whose lease the deadman last timed out, surfaced
+        # so each UI can tell "my link dropped" from "another device's link
+        # dropped" -- the shared last_error can't say which.
+        self.jog_timeout_epoch = None
         # Joystick command ordering (see _accept_jog_order): the highest seq
         # applied and the UI session it came from, both None until the first
         # seq-stamped command arrives.
         self._jog_seq = None
         self._jog_epoch = None
+        # Late-command filter (see _jog_latency): epoch -> (learned minimum
+        # clock offset, monotonic time it was last updated).
+        self._jog_clock = {}
         # Lift only: whether homing has been performed -- read once at connect
         # via check_homing() (statusword bit 12); None until checked / on the
         # cart, which has no homing. While not True, the lift is locked to
@@ -1165,20 +1207,33 @@ class RailController:
         A failed stop write pushes the deadline out by one poll cycle instead
         of disarming: a single dropped Modbus write must not be what leaves the
         axis running. Only the first attempt logs, so a dead link retries
-        quietly rather than at the poll rate."""
+        quietly rather than at the poll rate.
+
+        A successful stop's message clears itself after
+        JOG_DEADMAN_MESSAGE_HOLD_S, and jog_timeout_epoch records whose lease
+        it was, so the UIs can say whose link dropped."""
+        now = time.monotonic()
+        if self._jog_deadman_clear_at is not None and now >= self._jog_deadman_clear_at:
+            self._jog_deadman_clear_at = None
+            # Only our own message: anything written since is someone else's.
+            if (self.last_error or "").startswith(JOG_DEADMAN_MESSAGE):
+                self.last_error = None
         if (self._jog_deadline is None or self.jog_direction == 0
-                or time.monotonic() < self._jog_deadline):
+                or now < self._jog_deadline):
             return
         first = not self._jog_deadman_tripped
         self._jog_deadman_tripped = True
+        self.jog_timeout_epoch = self._jog_epoch
         ok, _message = self.jog_stop()      # clears _jog_deadline
         reason = (f"{JOG_DEADMAN_MESSAGE} (no update for "
                   f"{JOG_DEADMAN_TIMEOUT_S:.2f}s) -- ")
         if ok:
             self.last_error = reason + "stopped"
+            self._jog_deadman_clear_at = time.monotonic() + JOG_DEADMAN_MESSAGE_HOLD_S
         else:
             # Keep the write error in the message: that is the actionable part.
             self.last_error = reason + f"STOP FAILED, retrying: {self.last_error}"
+            self._jog_deadman_clear_at = None
             self._jog_deadline = time.monotonic() + STATE_POLL_INTERVAL_S
         if first:
             print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()}: "
@@ -2009,7 +2064,7 @@ class RailController:
         self.jog_direction = direction
         return True, "ok"
 
-    def jog_velocity(self, velocity, seq=None, epoch=None):
+    def jog_velocity(self, velocity, seq=None, epoch=None, sent=None):
         """Joystick drive: command an arbitrary signed target velocity (rpm),
         the magnitude being how far the stick is pushed and clamped to the
         configured full-scale joy speed (jog_speed). 0 releases the stick (ramp
@@ -2034,13 +2089,28 @@ class RailController:
         velocity standing on the drive -- the "let go and it keeps driving"
         failure. It is therefore checked and recorded under _jog_lock together
         with the velocity write, not on the way in (see _accept_jog_order /
-        _apply_jog_velocity). epoch identifies the UI session it belongs to."""
+        _apply_jog_velocity). epoch identifies the UI session it belongs to,
+        and sent is that session's clock at posting (ms), which lets a command
+        delivered late by a recovering WiFi link be recognised and dropped (see
+        _jog_latency).
+
+        The same gate is also checked once up front, without recording, so a
+        command that is going to be refused (stale, out of order, or from a
+        device that doesn't hold the stick) can't cancel a running Walking-mode
+        descent or drive-to-top move on its way to being refused."""
         try:
             velocity = int(round(float(velocity)))
         except (TypeError, ValueError):
             return False, f"invalid velocity {velocity!r}"
+        # Measured on arrival: the enable walk below can take a while, and
+        # that is our delay, not the network's.
+        late_by = self._jog_latency(epoch, sent)
         if self.pid_running:
             return False, "stop the PID loop before jogging"
+        with self._jog_lock:
+            refusal = self._jog_order_refusal(seq, epoch, velocity, late_by)
+        if refusal is not None:
+            return refusal
         # Manual drive overrides a running Walking-mode auto-lower or
         # drive-to-top move (see jog()).
         self._cancel_walk()
@@ -2073,43 +2143,105 @@ class RailController:
             if "jog_accel" in p and "jog_jerk" in p:
                 self._apply_motion_profile(p["jog_accel"], p["jog_jerk"])
 
-        return self._apply_jog_velocity(velocity, direction, seq, epoch)
+        return self._apply_jog_velocity(velocity, direction, seq, epoch, late_by)
 
-    def _accept_jog_order(self, seq, epoch):
-        """Ordering gate for UI joystick commands: True if this one should be
-        applied. Call with _jog_lock held -- checking and recording has to be
-        atomic with the velocity write, or two threads both pass and still
-        reach the drive in the wrong order.
+    def _jog_latency(self, epoch, sent):
+        """How much later than usual this UI command arrived (seconds), or
+        None when it can't be told (no epoch / sent -- curl, an older UI).
 
-        seq only orders commands within one UI SESSION (epoch), because a page
-        reload restarts the counter at 1: without the epoch a refreshed page
-        would have every command rejected against the old high-water mark, i.e.
-        a dead joystick. A command from a different epoch takes over and
-        re-bases the counter, so the most recently used tab owns the stick. Two
-        tabs dragging at once would flip-flop epochs and lose the guarantee
-        between them -- degenerate, and no worse than having no seq at all.
+        The browser's clock and ours are unrelated, so the offset between them
+        (our arrival time minus its sent time) means nothing on its own -- but
+        it is the same constant plus the network delay for every command of one
+        session. The smallest offset seen for that session is its fastest
+        delivery; anything above it is extra delay. The minimum may creep up by
+        JOG_CLOCK_DRIFT_ALLOWANCE to follow clock-rate drift (see there)."""
+        if epoch is None or sent is None:
+            return None
+        now = time.monotonic()
+        try:
+            offset = now - float(sent) / 1000.0
+        except (TypeError, ValueError):
+            return None
+        with self._jog_lock:
+            floor, updated = self._jog_clock.get(epoch, (offset, now))
+            floor = min(offset, floor + (now - updated) * JOG_CLOCK_DRIFT_ALLOWANCE)
+            self._jog_clock[epoch] = (floor, now)
+            if len(self._jog_clock) > JOG_CLOCK_SESSIONS_MAX:
+                oldest = min(self._jog_clock, key=lambda e: self._jog_clock[e][1])
+                del self._jog_clock[oldest]
+        return offset - floor
+
+    def _jog_lease_owner(self):
+        """The UI session (epoch) holding a live joystick lease on this axis,
+        or None -- no manual drive standing, a command without an epoch, or a
+        lease that has already expired."""
+        if (self.jog_direction == 0 or self._jog_deadline is None
+                or time.monotonic() >= self._jog_deadline):
+            return None
+        return self._jog_epoch
+
+    def _jog_order_refusal(self, seq, epoch, velocity, late_by):
+        """The (ok, message) to answer a UI joystick command with instead of
+        applying it, or None if it should be applied. Checks only, records
+        nothing -- see _accept_jog_order. Call with _jog_lock held.
+
+        * Another device holds the stick: while one UI session's lease is live,
+          no other session can take the axis over -- neither to drive nor to
+          release it. That is what keeps a device reconnecting after a WiFi
+          drop from flushing its backlog into somebody else's drive. The
+          stick frees up the moment the owner lets go or its lease runs out
+          (JOG_DEADMAN_TIMEOUT_S after its link drops); STOP works for anyone,
+          it doesn't come through here.
+        * Late: a drive command more than JOG_MAX_LATENCY_S later than its
+          session's fastest delivery is dropped (see JOG_MAX_LATENCY_S).
+        * Out of order: within one session, seq must increase.
 
         Commands with no seq -- curl, an older cached UI, and every internal
         stop (end stop, travel limit, the deadman itself) -- are always
         applied."""
         if seq is None:
-            return True
-        if epoch != self._jog_epoch:
-            self._jog_epoch = epoch          # new UI session takes over
-        elif self._jog_seq is not None and seq <= self._jog_seq:
-            return False
-        self._jog_seq = seq
-        return True
+            return None
+        owner = self._jog_lease_owner()
+        if owner is not None and epoch != owner:
+            return False, "another device is driving this axis"
+        if velocity != 0 and late_by is not None and late_by > JOG_MAX_LATENCY_S:
+            return False, f"command arrived {late_by:.2f}s late -- dropped"
+        if (epoch == self._jog_epoch and self._jog_seq is not None
+                and seq <= self._jog_seq):
+            return True, "superseded by a newer command"
+        return None
 
-    def _apply_jog_velocity(self, velocity, direction, seq, epoch):
+    def _accept_jog_order(self, seq, epoch, velocity, late_by=None):
+        """Ordering gate for UI joystick commands: None if this one should be
+        applied (and it is recorded as the latest), otherwise the (ok, message)
+        to answer it with -- see _jog_order_refusal for what is refused. Call
+        with _jog_lock held -- checking and recording has to be atomic with
+        the velocity write, or two threads both pass and still reach the drive
+        in the wrong order.
+
+        seq only orders commands within one UI SESSION (epoch), because a page
+        reload restarts the counter at 1: without the epoch a refreshed page
+        would have every command rejected against the old high-water mark, i.e.
+        a dead joystick. A command from a different epoch -- allowed once no
+        other session holds a live lease -- takes over and re-bases the
+        counter."""
+        refusal = self._jog_order_refusal(seq, epoch, velocity, late_by)
+        if refusal is not None or seq is None:
+            return refusal
+        self._jog_epoch = epoch
+        self._jog_seq = seq
+        return None
+
+    def _apply_jog_velocity(self, velocity, direction, seq, epoch, late_by):
         """Commit a joystick command: the ordering check, the velocity write
         and the deadman/direction bookkeeping, all under _jog_lock so
         concurrent handler threads apply their commands one at a time and in
         seq order (see jog_velocity). direction must be non-zero -- a release
         goes through jog_stop, which holds the same lock."""
         with self._jog_lock:
-            if not self._accept_jog_order(seq, epoch):
-                return True, "superseded by a newer command"
+            refusal = self._accept_jog_order(seq, epoch, velocity, late_by)
+            if refusal is not None:
+                return refusal
             if not self.set_target_velocity(velocity):
                 return False, self.last_error or "failed to set velocity"
             self.jog_direction = direction
@@ -2135,8 +2267,9 @@ class RailController:
         no seq and are therefore always applied; suppressing one as 'stale' is
         never right."""
         with self._jog_lock:
-            if not self._accept_jog_order(seq, epoch):
-                return True, "superseded by a newer command"
+            refusal = self._accept_jog_order(seq, epoch, 0)
+            if refusal is not None:
+                return refusal
             self.jog_direction = 0
             self._jog_deadline = None
             self._jog_deadman_tripped = False
@@ -3224,7 +3357,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
     GET  /api/state              -> live readout + params + flags for both
     POST /api/<name>/param       -> {key, value}
     POST /api/<name>/jog         -> {direction: -1|0|1}
-    POST /api/<name>/jog_velocity-> {velocity: signed rpm, seq: int, epoch: str}
+    POST /api/<name>/jog_velocity-> {velocity: signed rpm, seq: int, epoch: str,
+                                     sent: ms}
                                      Joystick drive. A held stick must be
                                      REPEATED (the UI does so every
                                      JOY_HOLD_INTERVAL_MS) or the deadman stops
@@ -3232,9 +3366,12 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                                      _enforce_jog_deadman). seq must increase
                                      within one epoch (a UI session id); lower
                                      ones are dropped as reordered stragglers
-                                     (reported ok). Both optional -- but without
+                                     (reported ok). While one epoch holds a live
+                                     lease, other epochs are refused. sent (the
+                                     session's own clock) lets late deliveries
+                                     be dropped. All optional -- but without
                                      them a release can be overtaken by an
-                                     in-flight update. See _accept_jog_order.
+                                     in-flight update. See _jog_order_refusal.
     POST /api/<name>/jog_stop
     POST /api/<name>/stop
     POST /api/<name>/enable
@@ -3286,11 +3423,17 @@ class RailRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The UI gives up on slow joystick posts (JOY_REQUEST_TIMEOUT_MS in
+            # app.js) and a phone can drop off WiFi mid-request; the command was
+            # still handled, there is just nobody left to answer.
+            pass
 
     def _send_static(self, rel_path):
         # Prevent path traversal; only serve from the webui/ folder.
@@ -3330,6 +3473,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "connected": ctrl.connected,
                 "drive_enabled": ctrl.drive_enabled,
                 "jog_direction": ctrl.jog_direction,
+                "jog_owner": ctrl._jog_lease_owner(),
+                "jog_timeout_epoch": ctrl.jog_timeout_epoch,
                 "pid_running": ctrl.pid_running,
                 "homing_complete": ctrl.homing_complete,
                 "homing_in_progress": ctrl.homing_in_progress,
@@ -3429,7 +3574,7 @@ class RailRequestHandler(BaseHTTPRequestHandler):
             return ctrl.jog(body.get("direction", 0))
         if action == "jog_velocity":
             return ctrl.jog_velocity(body.get("velocity", 0), body.get("seq"),
-                                     body.get("epoch"))
+                                     body.get("epoch"), body.get("sent"))
         if action == "jog_stop":
             return ctrl.jog_stop()
         if action == "stop":

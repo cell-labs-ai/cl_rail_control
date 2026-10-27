@@ -40,6 +40,13 @@ const JOY_DEADZONE = 0.06;
 // shared WiFi bus don't nuisance-stop a drive that is still being steered.
 const JOY_HOLD_INTERVAL_MS = 100;
 
+// A joystick post still unanswered after this long is abandoned so the sender
+// can post the stick's CURRENT value instead (only one is ever in flight -- see
+// makeVelocitySender). Well past a normal round trip including the first
+// post's enable walk; by then the server's deadman has long stopped the axis
+// anyway.
+const JOY_REQUEST_TIMEOUT_MS = 1000;
+
 // Identifies this page load in every joystick post. The server orders commands
 // by a counter that restarts at 1 whenever the page reloads, so it needs to know
 // when a counter belongs to a new session rather than being a stale straggler --
@@ -158,16 +165,25 @@ async function api(path, options) {
   return res.json();
 }
 
-async function post(name, action, payload) {
+// timeoutMs (optional) aborts a request that hasn't answered by then, so a
+// caller waiting on it isn't stuck for the minutes TCP can spend retrying over
+// a dead WiFi link. (AbortController rather than AbortSignal.timeout so older
+// tablet browsers work too.)
+async function post(name, action, payload, timeoutMs) {
+  const ctrl = timeoutMs ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
     return await api(`/api/${name}/${action}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload || {}),
+      signal: ctrl ? ctrl.signal : undefined,
     });
   } catch (err) {
     console.error(err);
     return { ok: false, message: String(err) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -279,16 +295,35 @@ function makeParamRow(name, spec) {
 // so an update issued just before the release can arrive after it; the server
 // drops anything whose seq it has already passed, which stops that straggler
 // from reinstating a velocity the operator has let go of. The epoch scopes the
-// counter to this page load -- see _accept_jog_order in rail_web_ui.py.
+// counter to this page load -- see _accept_jog_order in rail_web_ui.py. sent
+// (this page's clock) lets the server drop posts a recovering WiFi link
+// delivers late -- see _jog_latency there.
+//
+// At most ONE post is in flight. While the link is slow or down, ticks don't
+// queue up behind it -- they only note that a send is due, and when the post
+// in flight answers (or is abandoned after JOY_REQUEST_TIMEOUT_MS) the stick's
+// value as of THEN goes out. Without this, a dropped link stacked up 10 posts
+// a second in the browser, and the whole backlog was replayed onto the drive
+// when the link came back.
 function makeVelocitySender(name) {
   let timer = null;
   let current = 0;
   let lastSent = null;
   let seq = 0;
+  let inFlight = false;
+  let due = false;     // a send was wanted while one was in flight
 
   function send(v) {
+    if (inFlight) { due = true; return; }
+    inFlight = true;
     lastSent = v;
-    post(name, "jog_velocity", { velocity: v, seq: ++seq, epoch: JOY_EPOCH });
+    post(name, "jog_velocity",
+         { velocity: v, seq: ++seq, epoch: JOY_EPOCH, sent: performance.now() },
+         JOY_REQUEST_TIMEOUT_MS)
+      .finally(() => {
+        inFlight = false;
+        if (due) { due = false; tick(); }
+      });
   }
 
   // Repeat tick. A zero is sent once and then goes quiet: with nothing moving
@@ -837,7 +872,24 @@ function updatePanel(name, data) {
     p.joystick.fullScale = Number(data.params.jog_speed);
   }
 
-  p.errLine.textContent = data.last_error || "";
+  p.errLine.textContent = errorText(data);
+}
+
+// last_error is one message per axis, shown on every connected device, so on
+// its own it can't say WHOSE problem it is. The server tags the joystick
+// deadman with the session whose drive timed out and reports who holds the
+// stick (jog_owner); turn that into "you" vs "another device" here.
+function errorText(data) {
+  const err = data.last_error || "";
+  if (err.startsWith("manual drive timed out") && data.jog_timeout_epoch) {
+    return data.jog_timeout_epoch === JOY_EPOCH
+      ? `${err} -- this device's connection was too slow or dropped`
+      : `${err} -- the device that was driving lost its connection`;
+  }
+  if (!err && data.jog_owner && data.jog_owner !== JOY_EPOCH) {
+    return "another device is driving this axis";
+  }
+  return err;
 }
 
 async function poll() {

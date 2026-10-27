@@ -96,6 +96,8 @@ controller, keyed by controller `name`.
       "connected": true,
       "drive_enabled": true,
       "jog_direction": 0,
+      "jog_owner": null,
+      "jog_timeout_epoch": null,
       "pid_running": false,
       "homing_complete": null,
       "homing_in_progress": false,
@@ -133,6 +135,14 @@ controller, keyed by controller `name`.
   lift).
 - `jog_direction` is `-1` | `0` | `1` — what's currently commanded, not just
   what the UI last sent (the server can override it, e.g. end-stop stop).
+- `jog_owner` is the `epoch` of the UI session currently holding a live
+  joystick lease on that axis (`null` when nobody is driving it). Other
+  sessions' `jog_velocity` commands are refused until it lets go or its lease
+  expires — show "another device is driving" when it isn't your own epoch.
+- `jog_timeout_epoch` is the `epoch` whose lease the deadman last timed out.
+  `last_error` is shared by every connected UI, so compare this with your own
+  epoch to tell "my connection dropped" from "another device's did". A
+  successful deadman stop's `last_error` clears itself after 5 s.
 
 ### `POST /api/<controller>/<action>`
 
@@ -145,7 +155,7 @@ JSON (may be `{}`). Response is always
 |---|---|---|
 | `param` | `{"key": "jog_speed", "value": 500}` | set one live parameter (clamped server-side to its `min`/`max`) |
 | `jog` | `{"direction": -1\|0\|1}` | step-jog at the fixed jog speed (button-style, not the joystick) |
-| `jog_velocity` | `{"velocity": 340, "seq": 12, "epoch": "abc-123"}` | joystick drive — see "Joystick contract" below |
+| `jog_velocity` | `{"velocity": 340, "seq": 12, "epoch": "abc-123", "sent": 81234.5}` | joystick drive — see "Joystick contract" below |
 | `jog_stop` | `{}` | release the stick: ramp to zero, stay enabled |
 | `stop` | `{}` | full STOP (drive disabled, brake closed) |
 | `enable` | `{}` | enable the drive without commanding motion |
@@ -192,6 +202,22 @@ functionality" goal:
   (or pass `null`) and every command is just applied in arrival order,
   which is fine for a first cut but reintroduces the "let go and it keeps
   driving for a moment" race under bad network conditions.
+- **One device at a time.** While one `epoch` holds a live lease (see
+  `jog_owner` in `/api/state`), `jog_velocity` from any other epoch — drive
+  *or* release — is refused (`ok: false`, "another device is driving this
+  axis"). The stick frees up when the owner releases or its lease expires,
+  i.e. 350 ms after its link drops. `stop` is never gated: anyone can STOP.
+- `sent`: the page's own clock when the post was made, in ms —
+  `performance.now()` in the existing UI. It needn't agree with any other
+  clock: the server learns each epoch's offset from its fastest delivery and
+  refuses a **non-zero** command arriving more than 350 ms later than that
+  ("command arrived X s late -- dropped"). This is what stops a phone that
+  reconnects after a WiFi drop from replaying its queued backlog onto the
+  drive. Releases (`velocity: 0`) are never dropped as late. Optional; omit it
+  and nothing is filtered.
+- **Keep at most one post in flight.** Don't queue a post per tick behind a
+  slow one; when it answers (or after a ~1 s timeout — abort it), send the
+  stick's *current* value. See `makeVelocitySender` in `webui/app.js`.
 
 ## Drive to top (`drive_to_top`, lift only)
 
