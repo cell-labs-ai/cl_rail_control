@@ -711,11 +711,51 @@ function decodeControlword(cw) {
   return toHex(cw);
 }
 
+// Nanotec error numbers, bits 24-31 of 1003h:0xh (C5-E manual ch.10).
+const DRIVE_ERROR_NUMBERS = {
+  0: "Watchdog reset",
+  1: "Input voltage too high",
+  2: "Output current too high",
+  3: "Input voltage too low",
+  4: "Fieldbus error",
+  7: "Sensor 1 fault",
+  8: "Sensor 2 fault",
+  9: "Sensor 3 fault",
+  10: "Warning: positive limit switch exceeded",
+  11: "Warning: negative limit switch exceeded",
+  12: "Overtemperature",
+  13: "Following error (6065h/6066h exceeded)",
+  14: "Warning: nonvolatile memory full",
+  15: "Motor blocked",
+  16: "Warning: nonvolatile memory damaged",
+  18: "Sensor n fault",
+  21: "Warning: restart controller (nonvolatile memory)",
+  22: "Rated current must be set",
+  23: "Encoder resolution / pole pairs incorrect",
+  24: "Motor current too high, adjust PI parameters",
+  25: "Internal software error",
+  26: "Current too high at digital output",
+  30: "Slippage error too large",
+  32: "Internal error: reference voltage correction factor missing",
+  40: "Warning: ballast resistor thermally overloaded",
+  46: "Interlock error (60FDh bit 3 low)",
+};
+
 function fmtReadout(fmt, value) {
   if (value === null || value === undefined) return "–";
   if (fmt === "statusword") return `${decodeStatusword(value)} (${toHex(value)})`;
   if (fmt === "controlword") return `${decodeControlword(value)} (${toHex(value)})`;
   if (fmt === "hex" && typeof value === "number") return toHex(value);
+  // Newest drive error (1003h:01h): bits 24-31 = Nanotec error number,
+  // bits 16-23 = error register class (1001h), bits 0-15 = CiA error code.
+  // Table: C5-E manual ch.10 "1003h Pre-defined Error Field".
+  if (fmt === "errorcode" && typeof value === "number") {
+    if (value === 0) return "none";
+    const number = (value >>> 24) & 0xff;
+    const code = value & 0xffff;
+    const text = DRIVE_ERROR_NUMBERS[number] || `error number ${number}`;
+    return `${text} (#${number}, code ${toHex(code)})`;
+  }
   // Brake output (60FEh:01h bit 0): "1" = brake activated/closed, "0" = released.
   if (fmt === "brake" && typeof value === "number") {
     return (value & 1) ? "CLOSED (1)" : "released (0)";

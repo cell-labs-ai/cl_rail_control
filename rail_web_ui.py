@@ -550,6 +550,12 @@ READOUT_SPECS = [
     ("velocity_actual", 0x606C, 0x00, 32, True, "Velocity actual value (rpm)", None),
     ("torque_actual", 0x6077, 0x00, 16, True, "Torque actual value", None),
     ("error_count", 0x1003, 0x00, 8, False, "Error count", None),
+    # Newest entry of the drive's error stack (1003h:01h). A 'Fault' in the
+    # statusword only says the drive tripped; THIS says why (C5-E manual
+    # ch.10 "1003h Pre-defined Error Field": bits 0-15 error code, 16-23
+    # error register class, 24-31 Nanotec error number). Cleared by power
+    # cycle, not by a fault reset, so it stays readable after the fact.
+    ("error_code", 0x1003, 0x01, 32, False, "Last drive error (1003h:01h)", "errorcode"),
     ("analog_input_1", 0x3220, 0x01, 16, False, "Analog Input 1 (angle)", None),
     ("control_word", 0x6040, 0x00, 16, False, "Command (6040h)", "controlword"),
     ("digital_inputs", 0x60FD, 0x00, 32, False, "Endstops (60FDh)", "endstops"),
@@ -3183,6 +3189,7 @@ class RailController:
             "velocity_actual": int(self._sim_velocity),
             "torque_actual": int(self._sim_velocity * 0.1),
             "error_count": 0,
+            "error_code": 0,
             "analog_input_1": int(self._sim_angle),
             "control_word": 0x000F if self.drive_enabled else 0x0006,
             "digital_inputs": digital_inputs,
