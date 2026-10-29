@@ -349,6 +349,20 @@ HEARTBEAT_INTERVAL_S = 0.1
 # because the NanoJ program treats it as "not armed yet".
 HEARTBEAT_MAX = 0x7FFFFFFF
 
+# -- Modbus TCP link recovery -----------------------------------------------
+#
+# NanoLib does NOT reopen a Modbus TCP session once the drive (or the network)
+# has closed it: every read/write on that handle then fails with "Tcp socket
+# close" for the rest of the process lifetime, the heartbeat stops, the drive
+# halts itself, and every enable attempt reports "stuck in unknown" (the
+# statusword cannot even be read). The heartbeat thread is the one thing that
+# touches the link continuously, so it is where the loss is detected: after
+# RECONNECT_AFTER_FAILURES consecutive failed beats it tears the session down
+# and connects the same device handle again, retrying every RECONNECT_RETRY_S
+# until the drive takes it (see _reconnect()).
+RECONNECT_AFTER_FAILURES = 5    # consecutive heartbeat failures (~0.5 s)
+RECONNECT_RETRY_S = 2.0
+
 # Statusword (6041h) state-machine mask/pattern (full state table in
 # decodeStatusword(), app.js).
 STATUSWORD_STATE_MASK = 0x6F
@@ -788,6 +802,8 @@ class RailController:
         self._lock = bus_lock               # shared across all controllers on the bus
         self._simulate = simulate
         self.connected = simulate or handle is not None
+        self.last_bus_error = None          # text of the last failed read/write
+        self.reconnects = 0                 # successful link recoveries so far
 
         # Role-specific schemas: the cart carries PID, the lift has no
         # analog-angle readout.
@@ -973,7 +989,10 @@ class RailController:
         with self._lock:
             result = self._accessor.readNumber(
                 self._handle, Nanolib.OdIndex(index, sub))
-        return None if result.hasError() else result.getResult()
+        if result.hasError():
+            self.last_bus_error = str(result.getError())
+            return None
+        return result.getResult()
 
     def _read_angle(self):
         """Fresh Analog Input 1 read for the PID loop (one bus round trip).
@@ -999,8 +1018,54 @@ class RailController:
             result = self._accessor.writeNumber(
                 self._handle, int(value), Nanolib.OdIndex(index, sub), bits)
         if result.hasError():
+            self.last_bus_error = str(result.getError())
             self.last_error = f"write {index:#06x}:{sub:02x} failed: {result.getError()}"
             return False
+        return True
+
+    # -- Modbus TCP link recovery -------------------------------------------
+
+    def _reconnect(self):
+        """Tear down and re-establish this controller's Modbus TCP session on
+        the SAME device handle (see the RECONNECT_* block). Called from the
+        heartbeat thread once the link has been dead for a few beats; returns
+        True once the drive answers again.
+
+        The disconnect result is ignored on purpose: the session is usually
+        already gone, and NanoLib reports disconnecting a dead device as an
+        error. Both calls hold the bus lock, so the other controller's traffic
+        waits for the attempt (a TCP connect to a reachable host on the local
+        wire returns in milliseconds; an unreachable one fails on NanoLib's
+        own short timeout).
+
+        After a successful reconnect the cached enable/jog flags are dropped
+        -- the drive halted itself on the watchdog while the link was down,
+        and the poll loop's _sync_drive_flags only ever clears -- and the
+        NanoJ watchdog program is re-asserted, exactly as at start-up. Homing
+        is NOT redone: the drive keeps its reference unless it was power
+        cycled, in which case the usual UP-only lock-out / home-at-end-stop
+        path applies on the next poll."""
+        stamp = time.strftime('%H:%M:%S')
+        print(f"[{stamp}] {self.name.upper()} link: reconnecting "
+              f"(last bus error: {self.last_bus_error})")
+        with self._lock:
+            try:
+                self._accessor.disconnectDevice(self._handle)
+            except Exception as exc:          # never let this kill the beat
+                print(f"[{stamp}] {self.name.upper()} link: disconnect raised "
+                      f"{type(exc).__name__}: {exc}")
+            result = self._accessor.connectDevice(self._handle)
+        if result.hasError():
+            print(f"[{stamp}] {self.name.upper()} link: reconnect failed "
+                  f"({result.getError()}); retrying in {RECONNECT_RETRY_S:g} s")
+            return False
+        self.reconnects += 1
+        self.drive_enabled = False
+        self.jog_direction = 0
+        self._jog_deadline = None
+        self._write(OD_NANOJ_CONTROL, 1)
+        print(f"[{time.strftime('%H:%M:%S')}] {self.name.upper()} link: "
+              f"reconnected (recovery #{self.reconnects})")
         return True
 
     # -- connection watchdog heartbeat --------------------------------------
@@ -1019,6 +1084,8 @@ class RailController:
         otherwise spam) and stay out of last_error -- the drive stopping itself
         is the designed reaction, not an operator-actionable fault."""
         next_beat = time.monotonic()
+        failures = 0
+        next_reconnect = 0.0
         while not self._stop_event.is_set():
             self._heartbeat_value = self._heartbeat_value % HEARTBEAT_MAX + 1
             index, sub, bits = OD_HEARTBEAT
@@ -1027,6 +1094,18 @@ class RailController:
                     self._handle, self._heartbeat_value,
                     Nanolib.OdIndex(index, sub), bits)
             ok = not result.hasError()
+            if ok:
+                failures = 0
+            else:
+                self.last_bus_error = str(result.getError())
+                failures += 1
+                if (failures >= RECONNECT_AFTER_FAILURES
+                        and time.monotonic() >= next_reconnect):
+                    next_reconnect = time.monotonic() + RECONNECT_RETRY_S
+                    if self._reconnect():
+                        failures = 0
+                        next_beat = time.monotonic()
+                        continue        # beat again right away
             if ok != self.heartbeat_ok:
                 stamp = time.strftime('%H:%M:%S')
                 if ok:
@@ -1775,6 +1854,12 @@ class RailController:
         if not self.drive_enabled:
             self.last_error = ("drive did not reach Operation enabled "
                                f"(stuck in {_decode_cia402_state(status_word)})")
+            if status_word is None:
+                # Not a drive state at all: the statusword could not be read
+                # for the whole walk, i.e. the link is down (see RECONNECT_*).
+                self.last_error += (f" -- no reply from the drive, last bus "
+                                    f"error: {self.last_bus_error}; "
+                                    "reconnecting automatically")
             return False
         # Confirm Profile Velocity is actually running (6061h): the 6060h write
         # above is refused if the drive was still in 'Quick stop active' then,
@@ -3495,6 +3580,8 @@ class RailRequestHandler(BaseHTTPRequestHandler):
                 "homing_in_progress": ctrl.homing_in_progress,
                 "heartbeat_ok": ctrl.heartbeat_ok,
                 "last_error": ctrl.last_error,
+                "last_bus_error": ctrl.last_bus_error,
+                "reconnects": ctrl.reconnects,
                 "walk_status": ctrl.walk_status,
                 "top_move_status": ctrl.top_move_status,
                 "down_limit_active": ctrl._down_position_blocked(state.get("position_actual")),
@@ -3655,6 +3742,13 @@ def parse_args():
 
 
 def main():
+    # Under systemd stdout is a pipe, so Python block-buffers it and the
+    # journal shows nothing until the buffer fills -- link losses and state
+    # changes were invisible. Flush per line instead.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
     args = parse_args()
     manager = ControllerManager(simulate=args.simulate)
     manager.connect()
